@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collector
+  namespace: review-collector
+  labels:
+    app: collector
+    component: review-collector
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: collector
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: collector
+        component: review-collector
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: collector
+          image: review-collector:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -etcd=etcd.review-collector.svc.cluster.local:2379
+            - -nats=nats://nats.review-collector.svc.cluster.local:4222
+            - -window=1m
+            - -watermark=2m
+            - -health-addr=:8080
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: COLLECTOR_WORKER_ID
+              value: "$(POD_NAME)"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
