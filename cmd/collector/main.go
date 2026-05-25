@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,11 +32,16 @@ func main() {
 		watermark     = flag.Duration("watermark", 2*time.Minute, "watermark for late events (e.g. 1m, 2m)")
 		crashAfter    = flag.Duration("crash-after", 0, "симулировать падение узла через указанный интервал")
 		demoMode      = flag.Bool("demo", false, "демонстрационный режим: подробные логи")
+		healthAddr    = flag.String("health-addr", ":8080", "адрес HTTP-сервера для health-чеков")
 	)
 	flag.Parse()
 
 	logger, _ := zap.NewProduction()
 	defer logger.Sync()
+
+	// Флаг здоровья для Kubernetes probes.
+	var healthy atomic.Bool
+	healthy.Store(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -196,7 +205,37 @@ func main() {
 	)
 
 	// ========================================================================
-	// 5. Режим crash-after
+	// 5. HTTP-сервер для Kubernetes health probes
+	// ========================================================================
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"status": "shutting_down"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	healthListener, err := net.Listen("tcp", *healthAddr)
+	if err != nil {
+		logger.Fatal("HEALTH_LISTENER_FAILED", zap.String("addr", *healthAddr), zap.Error(err))
+	}
+	healthServer := &http.Server{Handler: mux}
+	go func() {
+		logger.Info("HEALTH_SERVER_STARTED", zap.String("addr", healthListener.Addr().String()))
+		if err := healthServer.Serve(healthListener); err != nil && err != http.ErrServerClosed {
+			logger.Error("HEALTH_SERVER_ERROR", zap.Error(err))
+		}
+	}()
+
+	// ========================================================================
+	// 6. Режим crash-after
 	// ========================================================================
 	if *crashAfter > 0 {
 		logger.Warn("CRASH_TIMER_ARMED", zap.Duration("will_crash_in", *crashAfter))
@@ -213,10 +252,13 @@ func main() {
 	}
 
 	// ========================================================================
-	// 6. Ожидание сигнала → graceful shutdown
+	// 7. Ожидание сигнала → graceful shutdown
 	// ========================================================================
 	sig := <-sigCh
 	logger.Info("SIGNAL_RECEIVED", zap.String("signal", sig.String()))
+
+	// Отмечаем сервер недоступным для Kubernetes probes.
+	healthy.Store(false)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
