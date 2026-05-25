@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/markfriz/wb-ozon-review-collector/internal/aggregator"
 	"github.com/markfriz/wb-ozon-review-collector/internal/collector"
 	"github.com/markfriz/wb-ozon-review-collector/internal/coordinator"
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
@@ -23,8 +24,10 @@ func main() {
 		natsURL       = flag.String("nats", "nats://localhost:4222", "NATS server URL")
 		workerID      = flag.String("worker", defaultWorkerID(), "unique worker ID")
 		source        = flag.String("source", "wildberries", "marketplace source (wildberries/ozon)")
-		crashAfter    = flag.Duration("crash-after", 0, "симулировать падение узла через указанный интервал (10s, 30s)")
-		demoMode      = flag.Bool("demo", false, "демонстрационный режим: логи более подробные")
+		windowDur     = flag.Duration("window", 1*time.Minute, "tumbling window duration (e.g. 30s, 1m, 5m)")
+		watermark     = flag.Duration("watermark", 2*time.Minute, "watermark for late events (e.g. 1m, 2m)")
+		crashAfter    = flag.Duration("crash-after", 0, "симулировать падение узла через указанный интервал")
+		demoMode      = flag.Bool("demo", false, "демонстрационный режим: подробные логи")
 	)
 	flag.Parse()
 
@@ -34,7 +37,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Перехват сигналов ОС.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 
@@ -68,12 +70,70 @@ func main() {
 	showAssignments(ctx, logger, coord, "before claiming")
 
 	// ========================================================================
-	// 2. NATS JetStream — публикатор отзывов
+	// 2. Сборщик отзывов
+	// ========================================================================
+	market := marketplace.NewSimulator(*source)
+	col := collector.New(coord, market)
+
+	go func() {
+		if err := col.Run(ctx); err != nil && err != context.Canceled {
+			logger.Error("COLLECTOR_RUN_ERROR", zap.Error(err))
+		}
+	}()
+
+	// ========================================================================
+	// 3. Оконная агрегация с поддержкой поздних событий (watermark)
+	// ========================================================================
+	//
+	// Алгоритм:
+	//   1. Каждый отзыв маршрутизируется в окно по review.Date (event time).
+	//   2. Окна хранятся в хеш-таблице windowStore с sync.Mutex.
+	//   3. На каждом тике ticker'а окна, чьё время истекло, флашатся.
+	//   4. После флаша окно остаётся в памяти на время watermark.
+	//   5. Поздние события вызывают пересчёт → WindowAgg с IsUpdate=true.
+	//   6. Окна старше watermark удаляются.
+	//
+	// Пайплайн:
+	//   collector ──► tw.Input()
+	//                    │
+	//          ┌─────────┴──────────────┐
+	//          │ review.Date → windowKey │
+	//          │ store.getOrCreate()     │
+	//          │ accumulate()            │
+	//          │ if flushed → recompute  │
+	//          └─────────┬──────────────┘
+	//                    │
+	//          ┌─────────┴──────────────┐
+	//          │ ticker: reapWindows()  │
+	//          │   • flush closed       │
+	//          │   • evict old          │
+	//          └─────────┬──────────────┘
+	//                    │
+	//                    ▼
+	//               tw.Output()
+	//              (WindowAgg)
+	//                    │
+	//          ┌─────────┴──────────┐
+	//          ▼                    ▼
+	//   NATS reviews.windowed    zap.Logger
+
+	tw := aggregator.NewTumblingWindow(*windowDur, *watermark, 5000)
+
+	// Forward: collector → aggregator
+	go func() {
+		for review := range col.Reviews() {
+			tw.Input() <- review
+		}
+		tw.Stop()
+	}()
+
+	// ========================================================================
+	// 4. NATS JetStream — публикатор агрегированных окон
 	// ========================================================================
 	logger.Info("CONNECTING_TO_NATS",
 		zap.String("url", *natsURL),
 		zap.String("stream", natspub.StreamName),
-		zap.String("subject", natspub.StreamSubject),
+		zap.String("subject", natspub.WindowedSubject),
 	)
 
 	publisher, err := natspub.NewJetStreamPublisher(ctx, *natsURL, logger)
@@ -84,7 +144,7 @@ func main() {
 		logger.Info("NATS_PUBLISHER_CLOSE")
 		pub, failed, pending := publisher.Stats()
 		logger.Info("NATS_FINAL_STATS",
-			zap.Int64("published", pub),
+			zap.Int64("windowed_published", pub),
 			zap.Int64("failed", failed),
 			zap.Int64("pending", pending),
 		)
@@ -93,37 +153,53 @@ func main() {
 		}
 	}()
 
-	// ========================================================================
-	// 3. Сборщик отзывов (etcD + marketplace + NATS publisher)
-	// ========================================================================
-	market := marketplace.NewSimulator(*source)
-	col := collector.New(coord, market, publisher)
-
-	// Локальный вывод собранных отзывов.
-	go printCollectedReviews(ctx, logger, col)
-
-	// Запуск сборщика.
+	// Читает WindowAgg из агрегатора, публикует в NATS + логирует.
 	go func() {
-		if err := col.Run(ctx); err != nil && err != context.Canceled {
-			logger.Error("COLLECTOR_RUN_ERROR", zap.Error(err))
+		for agg := range tw.Output() {
+			if err := publisher.PublishWindowAgg(ctx, agg); err != nil {
+				logger.Error("PUBLISH_WINDOW_FAILED",
+					zap.String("product", agg.ProductID),
+					zap.Error(err),
+				)
+			}
+
+			if agg.IsUpdate {
+				logger.Info("WINDOW_UPDATE_PUBLISHED",
+					zap.String("product", agg.ProductID),
+					zap.Time("window_start", agg.WindowStart),
+					zap.Float64("avg_rating", agg.AvgRating),
+					zap.Int("total_likes", agg.TotalLikes),
+					zap.Int("review_count", agg.ReviewCount),
+					zap.String("note", "late_event_recompute"),
+				)
+			} else {
+				logger.Info("WINDOW_AGG_PUBLISHED",
+					zap.String("product", agg.ProductID),
+					zap.Time("window_start", agg.WindowStart),
+					zap.Float64("avg_rating", agg.AvgRating),
+					zap.Int("total_likes", agg.TotalLikes),
+					zap.Int("review_count", agg.ReviewCount),
+				)
+			}
 		}
 	}()
 
-	logger.Info("COLLECTOR_STARTED",
+	// Запуск агрегатора.
+	go tw.Run(ctx)
+
+	logger.Info("PIPELINE_STARTED",
 		zap.String("worker", *workerID),
 		zap.String("source", *source),
-		zap.Strings("etcd", endpoints),
-		zap.String("nats", *natsURL),
-		zap.Duration("crash_after", *crashAfter),
+		zap.Duration("window", *windowDur),
+		zap.Duration("watermark", *watermark),
+		zap.String("nats_subject", natspub.WindowedSubject),
 	)
 
 	// ========================================================================
-	// 4. Режим crash-after — симуляция падения узла
+	// 5. Режим crash-after
 	// ========================================================================
 	if *crashAfter > 0 {
-		logger.Warn("CRASH_TIMER_ARMED",
-			zap.Duration("will_crash_in", *crashAfter),
-		)
+		logger.Warn("CRASH_TIMER_ARMED", zap.Duration("will_crash_in", *crashAfter))
 		go func() {
 			select {
 			case <-time.After(*crashAfter):
@@ -137,7 +213,7 @@ func main() {
 	}
 
 	// ========================================================================
-	// 5. Ожидание сигнала → graceful shutdown
+	// 6. Ожидание сигнала → graceful shutdown
 	// ========================================================================
 	sig := <-sigCh
 	logger.Info("SIGNAL_RECEIVED", zap.String("signal", sig.String()))
@@ -147,33 +223,28 @@ func main() {
 
 	logger.Info("GRACEFUL_SHUTDOWN_STARTING")
 
-	// 5a. Показываем назначения перед освобождением.
 	showAssignments(shutdownCtx, logger, coord, "before release")
 
-	// 5b. Останавливаем сборщик (ждём завершения горутин).
 	col.Stop()
+	<-tw.Flushed()
 
-	// 5c. Освобождаем шарды в etcd.
-	logger.Info("RELEASING_SHARDS",
-		zap.Int("shard_count", len(coord.OwnedProducts())),
-	)
+	logger.Info("RELEASING_SHARDS", zap.Int("shard_count", len(coord.OwnedProducts())))
 	if err := coord.ReleaseAll(shutdownCtx); err != nil {
 		logger.Error("RELEASE_ALL_ERROR", zap.Error(err))
 	}
 
 	cancel()
 
-	// 5d. Ждём завершения всех горутин.
 	<-shutdownCtx.Done()
 	if shutdownCtx.Err() == context.DeadlineExceeded {
 		logger.Warn("GRACEFUL_SHUTDOWN_TIMED_OUT")
 	}
 
-	// Примечание: publisher.Close() и coord.Close() выполняются в defer.
 	logger.Info("COLLECTOR_EXITED")
 }
 
-// showAssignments выводит карту назначений шардов.
+// ========================================================================
+
 func showAssignments(ctx context.Context, logger *zap.Logger, coord *coordinator.Coordinator, phase string) {
 	assignments, err := coord.ListAssignments(ctx)
 	if err != nil {
@@ -208,33 +279,4 @@ func splitEndpoints(s string) []string {
 		}
 	}
 	return eps
-}
-
-// printCollectedReviews читает отзывы из локального канала и выводит в лог.
-func printCollectedReviews(ctx context.Context, logger *zap.Logger, col *collector.Collector) {
-	count := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case review, ok := <-col.Reviews():
-			if !ok {
-				logger.Info("REVIEW_CHANNEL_CLOSED", zap.Int("total", count))
-				return
-			}
-			count++
-			logger.Info("REVIEW_COLLECTED",
-				zap.String("id", review.ID),
-				zap.String("product", review.ProductID),
-				zap.Int("rating", review.Rating),
-				zap.String("text", review.Text),
-				zap.Int("likes", review.Likes),
-				zap.Int("dislikes", review.Dislikes),
-				zap.Time("date", review.Date),
-			)
-			if count%25 == 0 {
-				logger.Info("REVIEW_PROGRESS", zap.Int("collected", count))
-			}
-		}
-	}
 }

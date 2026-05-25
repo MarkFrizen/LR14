@@ -12,26 +12,21 @@ import (
 	"go.uber.org/zap"
 )
 
-// ReviewPublisher — интерфейс для публикации отзывов (NATS, Kafka, файл и т.д.).
-type ReviewPublisher interface {
-	Publish(ctx context.Context, review models.Review) error
-	Close() error
-}
-
 // workerState отслеживает состояние горутины, обрабатывающей один product_id.
 type workerState struct {
 	productID string
 	startedAt time.Time
-	done      chan struct{} // закрывается при завершении горутины
+	done      chan struct{}
 }
 
 // Collector собирает отзывы с маркетплейса, распределяя шарды через etcd.
+// Собранные отзывы отправляются в локальный канал Reviews() для последующей
+// оконной агрегации. Сырые отзывы больше не публикуются в NATS напрямую.
 type Collector struct {
-	coord     *coordinator.Coordinator
-	market    *marketplace.Simulator
-	publisher ReviewPublisher
-	logger    *zap.Logger
-	reviews   chan models.Review // локальный канал для логирования/метрик
+	coord   *coordinator.Coordinator
+	market  *marketplace.Simulator
+	logger  *zap.Logger
+	reviews chan models.Review
 
 	mu      sync.Mutex
 	workers map[string]*workerState
@@ -40,20 +35,19 @@ type Collector struct {
 }
 
 // New создаёт новый сборщик.
-func New(coord *coordinator.Coordinator, market *marketplace.Simulator, pub ReviewPublisher) *Collector {
+func New(coord *coordinator.Coordinator, market *marketplace.Simulator) *Collector {
 	logger, _ := zap.NewProduction()
 	return &Collector{
-		coord:     coord,
-		market:    market,
-		publisher: pub,
-		logger:    logger,
-		reviews:   make(chan models.Review, 5000),
-		workers:   make(map[string]*workerState),
-		stopCh:    make(chan struct{}),
+		coord:   coord,
+		market:  market,
+		logger:  logger,
+		reviews: make(chan models.Review, 5000),
+		workers: make(map[string]*workerState),
+		stopCh:  make(chan struct{}),
 	}
 }
 
-// Reviews возвращает канал с собранными отзывами (для локального логирования).
+// Reviews возвращает канал с собранными отзывами (для агрегатора).
 func (c *Collector) Reviews() <-chan models.Review {
 	return c.reviews
 }
@@ -147,7 +141,7 @@ func (c *Collector) claimAndSpawn(ctx context.Context) error {
 }
 
 // spawnWorker запускает горутину для сбора отзывов по product_id.
-// Каждый отзыв публикуется в NATS JetStream через publisher и дублируется в локальный канал.
+// Отзывы отправляются в канал Reviews() — агрегатор обработает их окнами.
 func (c *Collector) spawnWorker(ctx context.Context, productID string) {
 	c.mu.Lock()
 	if _, exists := c.workers[productID]; exists {
@@ -184,16 +178,6 @@ func (c *Collector) spawnWorker(ctx context.Context, productID string) {
 		}
 
 		for _, r := range reviews {
-			// 1. Публикуем в NATS JetStream (exactly-once).
-			if err := c.publisher.Publish(ctx, r); err != nil {
-				c.logger.Error("PUBLISH_FAILED",
-					zap.String("review_id", r.ID),
-					zap.String("product", productID),
-					zap.Error(err),
-				)
-			}
-
-			// 2. Дублируем в локальный канал для логирования.
 			select {
 			case c.reviews <- r:
 			case <-ctx.Done():
@@ -246,7 +230,6 @@ func (c *Collector) printStatus() {
 	)
 }
 
-// Stop отправляет сигнал остановки.
 func (c *Collector) Stop() {
 	select {
 	case <-c.stopCh:

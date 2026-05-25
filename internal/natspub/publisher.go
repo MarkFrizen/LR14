@@ -17,16 +17,17 @@ import (
 )
 
 const (
-	StreamName      = "reviews"
-	StreamSubject   = "reviews.raw"
-	StreamMaxAge    = 24 * time.Hour
-	DedupWindow     = 2 * time.Minute
-	PublishTimeout  = 30 * time.Second
-	MaxRetries      = 3
-	AckWaitInterval = 500 * time.Millisecond
+	StreamName          = "reviews"
+	RawSubject          = "reviews.raw"
+	WindowedSubject     = "reviews.windowed"
+	StreamMaxAge        = 24 * time.Hour
+	DedupWindow         = 2 * time.Minute
+	PublishTimeout      = 30 * time.Second
+	MaxRetries          = 3
+	AckWaitInterval     = 500 * time.Millisecond
 )
 
-// JetStreamPublisher публикует отзывы в NATS JetStream с exactly-once доставкой.
+// JetStreamPublisher публикует данные в NATS JetStream с exactly-once доставкой.
 type JetStreamPublisher struct {
 	nc     *nats.Conn
 	js     jetstream.JetStream
@@ -80,7 +81,7 @@ func NewJetStreamPublisher(ctx context.Context, urls string, logger *zap.Logger)
 	logger.Info("JETSTREAM_PUBLISHER_READY",
 		zap.String("urls", urls),
 		zap.String("stream", StreamName),
-		zap.String("subject", StreamSubject),
+		zap.Strings("subjects", []string{RawSubject, WindowedSubject}),
 	)
 
 	return p, nil
@@ -89,7 +90,7 @@ func NewJetStreamPublisher(ctx context.Context, urls string, logger *zap.Logger)
 func (p *JetStreamPublisher) initStream(ctx context.Context) error {
 	_, err := p.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:       StreamName,
-		Subjects:   []string{StreamSubject},
+		Subjects:   []string{RawSubject, WindowedSubject},
 		MaxAge:     StreamMaxAge,
 		MaxMsgs:    -1,
 		MaxBytes:   -1,
@@ -101,22 +102,33 @@ func (p *JetStreamPublisher) initStream(ctx context.Context) error {
 	return err
 }
 
-// Publish отправляет отзыв в JetStream асинхронно с MsgId для дедупликации.
-func (p *JetStreamPublisher) Publish(ctx context.Context, review models.Review) error {
+// PublishRaw отправляет сырой отзыв в "reviews.raw".
+func (p *JetStreamPublisher) PublishRaw(ctx context.Context, review models.Review) error {
+	return p.publishJSON(ctx, RawSubject, review, review.ID)
+}
+
+// PublishWindowAgg отправляет агрегированное окно в "reviews.windowed".
+// Dedup-ключ = productID + windowStart для exactly-one доставки.
+func (p *JetStreamPublisher) PublishWindowAgg(ctx context.Context, agg models.WindowAgg) error {
+	dedupKey := fmt.Sprintf("%s-%d", agg.ProductID, agg.WindowStart.UnixNano())
+	return p.publishJSON(ctx, WindowedSubject, agg, dedupKey)
+}
+
+// publishJSON сериализует любой объект в JSON и публикует в JetStream.
+func (p *JetStreamPublisher) publishJSON(ctx context.Context, subject string, v any, dedupKey string) error {
 	if p.stopped.Load() {
 		return errors.New("publisher is stopped")
 	}
 
-	data, err := json.Marshal(review)
+	data, err := json.Marshal(v)
 	if err != nil {
-		return fmt.Errorf("marshal review: %w", err)
+		return fmt.Errorf("marshal: %w", err)
 	}
 
 	p.pending.Add(1)
 
-	// Используем PublishAsync c WithMsgID для exactly-once.
-	future, err := p.js.PublishAsync(StreamSubject, data,
-		jetstream.WithMsgID(review.ID),
+	future, err := p.js.PublishAsync(subject, data,
+		jetstream.WithMsgID(dedupKey),
 	)
 	if err != nil {
 		p.pending.Add(-1)
@@ -170,7 +182,6 @@ func (p *JetStreamPublisher) ackLoop(ctx context.Context) {
 					zap.String("msg_id", msgID),
 					zap.Error(err),
 				)
-				// Ретрай в отдельной горутине.
 				go p.retryPublish(ctx, msg, msgID, 1)
 			}
 		}
