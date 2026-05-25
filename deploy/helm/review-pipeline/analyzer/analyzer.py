@@ -79,8 +79,7 @@ async def main():
     parser.add_argument("--flush-interval", type=int, default=FLUSH_INTERVAL)
     args = parser.parse_args()
 
-    global FLUSH_INTERVAL
-    FLUSH_INTERVAL = args.flush_interval
+    globals()['FLUSH_INTERVAL'] = args.flush_interval
 
     print(f"[ANALYZER] Connecting to NATS: {args.nats}")
     nc = await connect(args.nats)
