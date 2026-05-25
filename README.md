@@ -41,4 +41,3 @@ end
 subgraph “Arrow Flight”
 P <-->|RecordBatches| A[Go Arrow Server]
 end
-# LR14
