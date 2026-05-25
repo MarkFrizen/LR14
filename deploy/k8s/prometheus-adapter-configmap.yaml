@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter
+  namespace: monitoring
+data:
+  config.yaml: |
+    rules:
+      # ── Кастомная метрика: длина очереди NATS JetStream ───────────────
+      - seriesQuery: |
+          nats_jetstream_consumer_pending_messages{stream!="",consumer!=""}
+        resources:
+          overrides:
+            # Привязываем метку namespace к ресурсу Kubernetes
+            namespace: { resource: "namespace" }
+            # Привязываем pod (измеряем на каждом поде)
+            pod:     { resource: "pod" }
+        name:
+          matches: "nats_jetstream_consumer_pending_messages"
+          as: "nats_queue_pending"
+        metricsQuery: |
+          sum(nats_jetstream_consumer_pending_messages{
+            <<.LabelMatchers>>
+          }) by (<<.GroupBy>>)
+
+      # ── Метрика-флаг: consumer жив ────────────────────────────────────
+      - seriesQuery: |
+          nats_jetstream_consumer_info{stream!="",consumer!=""}
+        resources:
+          overrides:
+            namespace: { resource: "namespace" }
+            pod:       { resource: "pod" }
+        name:
+          matches: "nats_jetstream_consumer_info"
+          as: "nats_consumer_alive"
+        metricsQuery: |
+          sum(nats_jetstream_consumer_info{
+            <<.LabelMatchers>>
+          }) by (<<.GroupBy>>)

@@ -9,9 +9,9 @@
 **Промпт:** "Напиши на Go программу-сборщик отзывов с маркетплейса (имитация API Wildberries/Ozon). Программа должна подключаться к etcd, получать список product_id (шарды) через лизинг, запускать горутины для каждого product_id и собирать отзывы в структуру Review (id, product_id, rating, text, likes, dislikes, date). Покажи пример работы с клиентом etcd (clientv3) и graceful shutdown."
 **Результат:** Сборка и go vet проходят без ошибок. Вот что получилось:
     Структура проекта
-     1 cmd/collector/main.go          - точка входа, graceful shutdown
+     1 cmd/collector/main.go   - точка входа, graceful shutdown
      2 internal/
-     3 ├── models/review.go           - структура Review
+     3 ├── models/review.go    - структура Review
      4 ├── marketplace/simulator.go   - имитация API Wildberries/Ozon
      5 ├── coordinator/coordinator.go - координация через etcd (лизинг + шардирование)
      6 └── collector/collector.go     - сборщик с горутинами
@@ -83,14 +83,120 @@
 **Результат:** Создан Dockerfile для Go-сборщика отзывов
 ### Промпт 2
 **Промпт:** "Добавь Horizontal Pod Autoscaler (HPA) для Go-сборщика на основе кастомной метрики – длины очереди NATS JetStream (количество необработанных сообщений в consumer). Используй Prometheus + Prometheus Adapter. Покажи конфигурацию ServiceMonitor и правило HPA."
-**Результат:** 
+**Результат:** 1. Код: монитор очереди NATS → Prometheus
+
+    Новый пакет internal/monitor/queuemon.go:
+
+     - Создаёт durable consumer review-collector-worker на стриме reviews
+     - Раз в 15 сек опрашивает NATS JetStream и обновляет Prometheus-gauge:
+- nats_jetstream_consumer_pending_messages{stream, consumer} —
+  необработанные сообщения
+- nats_jetstream_consumer_info{stream, consumer} — 1 если consumer жив
+     - Метрики авторегистрируются через promauto
+
+    Изменён cmd/collector/main.go:
+
+     - Добавлен импорт monitor и promhttp
+     - После создания NATS publisher запускается QueueMonitor в отдельной
+горутине
+     - На /metrics раздаётся Prometheus-эндпоинт
+
+    2. ServiceMonitor
+
+    deploy/k8s/servicemonitor.yaml:
+
+      1 apiVersion: monitoring.coreos.com/v1
+      2 kind: ServiceMonitor
+      3 metadata:
+      4   name: collector
+      5   namespace: review-collector
+      6 spec:
+      7   selector:
+      8     matchLabels:
+      9app: collector
+     10   endpoints:
+     11     - port: http
+     12path: /metrics
+     13interval: 15s
+
+    3. Prometheus Adapter ConfigMap
+
+    deploy/k8s/prometheus-adapter-configmap.yaml:
+
+    Правило преобразует nats_jetstream_consumer_pending_messages →
+    pods/nats_queue_pending в custom.metrics.k8s.io:
+
+      1 rules:
+      2   - seriesQuery: nats_jetstream_consumer_pending_messages{...}
+      3     resources:
+      4overrides:
+      5  namespace: { resource: "namespace" }
+      6  pod:{ resource: "pod" }
+      7     name:
+      8as: "nats_queue_pending"
+      9     metricsQuery: |
+     10
+ sum(nats_jetstream_consumer_pending_messages{<<.LabelMatchers>>}) by 
+ (<<.GroupBy>>)
+
+    4. HPA с кастомной метрикой
+
+    deploy/k8s/hpa.yaml:
+
+      1 spec:
+      2   minReplicas: 2
+      3   maxReplicas: 10
+      4   metrics:
+      5     - type: Resource
+      6resource:
+      7  name: cpu
+      8  target:
+      9    type: Utilization
+     10    averageUtilization: 70
+     11     - type: Resource
+     12resource:
+     13  name: memory
+     14  target:
+     15    type: Utilization
+     16    averageUtilization: 80
+     17     - type: Pods# <-- кастомная метрика
+     18pods:
+     19  metric:
+     20    name: nats_queue_pending
+     21  target:
+     22    type: AverageValue
+     23    averageValue: 500   # scale up если >500 сообщений в consumer
 ### Промпт 3
-**Промпт:** ""
-**Результат:** 
+**Промпт:** "Настрой развёртывание всего конвейера (etcd, NATS, Go-сборщик, Python-анализатор, Streamlit) в minikube с помощью Helm-чарта. Приведи структуру чарта, values.yaml и команды для установки. Покажи, как проверить автоскалирование при увеличении нагрузки (например, скрипт генерации отзывов)."
+**Результат:** Создана структура чарта
+      1 deploy/helm/review-pipeline/
+      2 ├── Chart.yaml   # Методанные + зависимости (etcd, nats)
+      3 ├── values.yaml  # Все параметры
+      4 ├── .helmignore
+      5 ├── README.md
+      6 ├── load-test.py # Скрипт нагрузки для теста HPA
+      7 ├── analyzer/
+      8 │   ├── analyzer.py     # Python NATS consumer
+      9 │   ├── Dockerfile
+     10 │   └── requirements.txt
+     11 ├── streamlit/
+     12 │   ├── dashboard.py    # Streamlit dashboard
+     13 │   ├── Dockerfile
+     14 │   └── requirements.txt
+     15 └── templates/
+     16     ├── _helpers.tpl    # Шаблонные имена/URL сервисов
+     17     ├── namespace.yaml
+     18     ├── collector-deployment.yaml     # Go-сборщик
+     19     ├── collector-service.yaml
+     20     ├── collector-hpa.yaml     # HPA (CPU + RAM + nats_queue_pending)
+     21     ├── collector-servicemonitor.yaml # Prometheus ServiceMonitor
+     22     ├── analyzer-deployment.yaml      # Python анализатор + PVC
+     23     ├── streamlit-deployment.yaml     # Streamlit дашборд + Service
+     24     └── prometheus-adapter-configmap.yaml
 ### Итого
 - Количество промптов: 3
 - Что пришлось исправлять вручную: ничего
-- Время: ~ мин
+- Время: ~15 мин
 
 ## Задание 6: Веб-дашборд с обновлением в реальном времени.
 ### Промпт 1

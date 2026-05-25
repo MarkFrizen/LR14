@@ -18,7 +18,9 @@ import (
 	"github.com/markfriz/wb-ozon-review-collector/internal/collector"
 	"github.com/markfriz/wb-ozon-review-collector/internal/coordinator"
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
+	"github.com/markfriz/wb-ozon-review-collector/internal/monitor"
 	"github.com/markfriz/wb-ozon-review-collector/internal/natspub"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
@@ -196,6 +198,20 @@ func main() {
 	// Запуск агрегатора.
 	go tw.Run(ctx)
 
+	// ========================================================================
+	// 4b. Prometheus-монитор очереди NATS JetStream
+	// ========================================================================
+	const consumerName = "review-collector-worker"
+	js := publisher.JetStream()
+
+	_, err = monitor.MustRegisterConsumer(ctx, js, natspub.StreamName, consumerName, natspub.RawSubject, logger)
+	if err != nil {
+		logger.Warn("CONSUMER_REGISTRATION_FAILED", zap.Error(err))
+	}
+
+	qm := monitor.NewQueueMonitor(js, natspub.StreamName, []string{consumerName}, logger)
+	go qm.Run(ctx)
+
 	logger.Info("PIPELINE_STARTED",
 		zap.String("worker", *workerID),
 		zap.String("source", *source),
@@ -221,6 +237,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	mux.Handle("/metrics", promhttp.Handler())
 
 	healthListener, err := net.Listen("tcp", *healthAddr)
 	if err != nil {

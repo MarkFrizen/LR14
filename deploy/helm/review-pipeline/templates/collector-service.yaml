@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "review-pipeline.fullname" . }}-collector
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "review-pipeline.labels" . | nindent 4 }}
+    {{- include "review-pipeline.collector.matchLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "review-pipeline.collector.matchLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.collector.servicePort }}
+      targetPort: health
+      protocol: TCP

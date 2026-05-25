@@ -1,0 +1,131 @@
+# =============================================================================
+# values.yaml — review-pipeline Helm Chart
+# =============================================================================
+
+# ── Namespace ────────────────────────────────────────────────────────────────
+namespace: review-pipeline
+monitoringNamespace: monitoring
+
+# ── etcd ─────────────────────────────────────────────────────────────────────
+etcd:
+  enabled: true
+  externalEndpoints: []       # используется если enabled: false
+  # Параметры bitnami/etcd
+  replicaCount: 1
+  persistence:
+    size: 1Gi
+
+# ── NATS ─────────────────────────────────────────────────────────────────────
+nats:
+  enabled: true
+  externalURL: "nats://nats:4222"
+
+  # Параметры bitnami/nats
+  jetstream:
+    enabled: true
+    memoryStore:
+      enabled: true
+      size: 256Mi
+    fileStore:
+      enabled: false
+    domains:
+      - maxAge: 24h
+
+# ── Go Collector ─────────────────────────────────────────────────────────────
+collector:
+  replicas: 3
+  healthPort: 8080
+  servicePort: 8080
+  terminationGracePeriod: 45
+  windowDuration: 1m
+  watermarkDuration: 2m
+
+  image:
+    repository: review-collector
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  # ── Horizontal Pod Autoscaler ──────────────────────────────────────────────
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    cpuTargetAverageUtilization: 70
+    memoryTargetAverageUtilization: 80
+    behavior:
+      scaleDown:
+        stabilizationWindowSeconds: 120
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 30
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 2
+            periodSeconds: 15
+        selectPolicy: Max
+    customMetrics:
+      enabled: true
+      natsPendingTarget: 500
+
+  # ── ServiceMonitor (Prometheus Operator) ────────────────────────────────────
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    prometheusRelease: prometheus-stack
+
+# ── Python Analyzer ──────────────────────────────────────────────────────────
+analyzer:
+  replicas: 1
+  flushInterval: 30
+
+  image:
+    repository: review-analyzer
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 128Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+
+  storageSize: 1Gi
+
+# ── Streamlit Dashboard ──────────────────────────────────────────────────────
+streamlit:
+  replicas: 1
+  serviceType: ClusterIP
+
+  image:
+    repository: review-streamlit
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

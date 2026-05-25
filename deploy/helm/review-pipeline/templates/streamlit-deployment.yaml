@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "review-pipeline.fullname" . }}-streamlit
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "review-pipeline.labels" . | nindent 4 }}
+    {{- include "review-pipeline.streamlit.matchLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.streamlit.replicas }}
+  selector:
+    matchLabels:
+      {{- include "review-pipeline.streamlit.matchLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "review-pipeline.streamlit.matchLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: streamlit
+          image: {{ .Values.streamlit.image.repository }}:{{ .Values.streamlit.image.tag }}
+          imagePullPolicy: {{ .Values.streamlit.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8501
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+          resources:
+            {{- toYaml .Values.streamlit.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "review-pipeline.fullname" . }}-analyzer-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "review-pipeline.fullname" . }}-streamlit
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "review-pipeline.labels" . | nindent 4 }}
+    {{- include "review-pipeline.streamlit.matchLabels" . | nindent 4 }}
+spec:
+  type: {{ .Values.streamlit.serviceType }}
+  selector:
+    {{- include "review-pipeline.streamlit.matchLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

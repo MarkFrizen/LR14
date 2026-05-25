@@ -1,0 +1,23 @@
+{{- if .Values.collector.hpa.customMetrics.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter
+  namespace: {{ .Values.monitoringNamespace }}
+data:
+  config.yaml: |
+    rules:
+      - seriesQuery: |
+          nats_jetstream_consumer_pending_messages{stream!="",consumer!=""}
+        resources:
+          overrides:
+            namespace: { resource: "namespace" }
+            pod:       { resource: "pod" }
+        name:
+          matches: "nats_jetstream_consumer_pending_messages"
+          as: "nats_queue_pending"
+        metricsQuery: |
+          sum(nats_jetstream_consumer_pending_messages{
+            <<.LabelMatchers>>
+          }) by (<<.GroupBy>>)
+{{- end }}

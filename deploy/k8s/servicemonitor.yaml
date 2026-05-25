@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: collector
+  namespace: review-collector
+  labels:
+    app: collector
+    release: prometheus-stack  # должен совпадать с release меткой Prometheus Operator
+spec:
+  selector:
+    matchLabels:
+      app: collector
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+      - review-collector

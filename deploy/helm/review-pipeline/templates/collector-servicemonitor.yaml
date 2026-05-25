@@ -1,0 +1,23 @@
+{{- if .Values.collector.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "review-pipeline.fullname" . }}-collector
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "review-pipeline.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+    release: {{ .Values.collector.serviceMonitor.prometheusRelease }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "review-pipeline.collector.matchLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.collector.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.collector.serviceMonitor.scrapeTimeout }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.namespace }}
+{{- end }}

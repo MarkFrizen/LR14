@@ -233,6 +233,11 @@ func (p *JetStreamPublisher) Stats() (published, failed, pending int64) {
 	return p.published.Load(), p.failed.Load(), p.pending.Load()
 }
 
+// JetStream возвращает JetStream-контекст для внешних компонентов (например, монитора очереди).
+func (p *JetStreamPublisher) JetStream() jetstream.JetStream {
+	return p.js
+}
+
 func (p *JetStreamPublisher) drainPending() {
 	p.logger.Info("DRAINING_PENDING_MESSAGES",
 		zap.Int64("pending", p.pending.Load()),

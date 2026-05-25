@@ -1,0 +1,16 @@
+apiVersion: v2
+name: review-pipeline
+description: Helm-чарт для ETL-конвейера анализа отзывов маркетплейсов
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: etcd
+    version: "10.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: etcd.enabled
+  - name: nats
+    version: "1.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition: nats.enabled

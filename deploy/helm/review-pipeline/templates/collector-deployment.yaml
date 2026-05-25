@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "review-pipeline.fullname" . }}-collector
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "review-pipeline.labels" . | nindent 4 }}
+    {{- include "review-pipeline.collector.matchLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.collector.replicas }}
+  selector:
+    matchLabels:
+      {{- include "review-pipeline.collector.matchLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.collector.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.collector.rollingUpdate.maxSurge }}
+  template:
+    metadata:
+      labels:
+        {{- include "review-pipeline.collector.matchLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.collector.healthPort }}"
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.collector.terminationGracePeriod }}
+      containers:
+        - name: collector
+          image: {{ .Values.collector.image.repository }}:{{ .Values.collector.image.tag }}
+          imagePullPolicy: {{ .Values.collector.image.pullPolicy }}
+          args:
+            - -etcd={{ include "review-pipeline.etcd.endpoint" . }}
+            - -nats={{ include "review-pipeline.nats.url" . }}
+            - -window={{ .Values.collector.windowDuration }}
+            - -watermark={{ .Values.collector.watermarkDuration }}
+            - -health-addr=:{{ .Values.collector.healthPort }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.collector.healthPort }}
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: COLLECTOR_WORKER_ID
+              value: "$(POD_NAME)"
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
