@@ -1,0 +1,259 @@
+package natspub
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/markfriz/wb-ozon-review-collector/internal/models"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
+)
+
+const (
+	StreamName      = "reviews"
+	StreamSubject   = "reviews.raw"
+	StreamMaxAge    = 24 * time.Hour
+	DedupWindow     = 2 * time.Minute
+	PublishTimeout  = 30 * time.Second
+	MaxRetries      = 3
+	AckWaitInterval = 500 * time.Millisecond
+)
+
+// JetStreamPublisher публикует отзывы в NATS JetStream с exactly-once доставкой.
+type JetStreamPublisher struct {
+	nc     *nats.Conn
+	js     jetstream.JetStream
+	logger *zap.Logger
+
+	pubAckCh chan jetstream.PubAckFuture
+
+	published atomic.Int64
+	failed    atomic.Int64
+	pending   atomic.Int64
+
+	stopCh chan struct{}
+	wg     sync.WaitGroup
+	stopped atomic.Bool
+}
+
+func NewJetStreamPublisher(ctx context.Context, urls string, logger *zap.Logger) (*JetStreamPublisher, error) {
+	nc, err := nats.Connect(urls,
+		nats.Name("review-collector"),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.Timeout(5*time.Second),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("nats connect: %w", err)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("jetstream new: %w", err)
+	}
+
+	p := &JetStreamPublisher{
+		nc:       nc,
+		js:       js,
+		logger:   logger,
+		pubAckCh: make(chan jetstream.PubAckFuture, 10000),
+		stopCh:   make(chan struct{}),
+	}
+
+	if err := p.initStream(ctx); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("init stream: %w", err)
+	}
+
+	p.wg.Add(1)
+	go p.ackLoop(ctx)
+
+	logger.Info("JETSTREAM_PUBLISHER_READY",
+		zap.String("urls", urls),
+		zap.String("stream", StreamName),
+		zap.String("subject", StreamSubject),
+	)
+
+	return p, nil
+}
+
+func (p *JetStreamPublisher) initStream(ctx context.Context) error {
+	_, err := p.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:       StreamName,
+		Subjects:   []string{StreamSubject},
+		MaxAge:     StreamMaxAge,
+		MaxMsgs:    -1,
+		MaxBytes:   -1,
+		Storage:    jetstream.FileStorage,
+		Duplicates: DedupWindow,
+		Retention:  jetstream.LimitsPolicy,
+		Discard:    jetstream.DiscardOld,
+	})
+	return err
+}
+
+// Publish отправляет отзыв в JetStream асинхронно с MsgId для дедупликации.
+func (p *JetStreamPublisher) Publish(ctx context.Context, review models.Review) error {
+	if p.stopped.Load() {
+		return errors.New("publisher is stopped")
+	}
+
+	data, err := json.Marshal(review)
+	if err != nil {
+		return fmt.Errorf("marshal review: %w", err)
+	}
+
+	p.pending.Add(1)
+
+	// Используем PublishAsync c WithMsgID для exactly-once.
+	future, err := p.js.PublishAsync(StreamSubject, data,
+		jetstream.WithMsgID(review.ID),
+	)
+	if err != nil {
+		p.pending.Add(-1)
+		return fmt.Errorf("publish async: %w", err)
+	}
+
+	select {
+	case p.pubAckCh <- future:
+	case <-ctx.Done():
+		p.pending.Add(-1)
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+// ackLoop обрабатывает подтверждения от PublishAsync.
+func (p *JetStreamPublisher) ackLoop(ctx context.Context) {
+	defer p.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.stopCh:
+			p.drainPending()
+			return
+		case future, ok := <-p.pubAckCh:
+			if !ok {
+				return
+			}
+
+			msg := future.Msg()
+			msgID := msg.Header.Get(jetstream.MsgIDHeader)
+
+			select {
+			case ack := <-future.Ok():
+				p.published.Add(1)
+				p.pending.Add(-1)
+				p.logger.Debug("PUB_ACK_OK",
+					zap.String("msg_id", msgID),
+					zap.String("stream", ack.Stream),
+					zap.Uint64("seq", ack.Sequence),
+					zap.Bool("duplicate", ack.Duplicate),
+				)
+
+			case err := <-future.Err():
+				p.failed.Add(1)
+				p.pending.Add(-1)
+				p.logger.Warn("PUB_ACK_ERR",
+					zap.String("msg_id", msgID),
+					zap.Error(err),
+				)
+				// Ретрай в отдельной горутине.
+				go p.retryPublish(ctx, msg, msgID, 1)
+			}
+		}
+	}
+}
+
+// retryPublish повторяет публикацию с экспоненциальной задержкой.
+func (p *JetStreamPublisher) retryPublish(ctx context.Context, msg *nats.Msg, msgID string, attempt int) {
+	if attempt > MaxRetries {
+		p.logger.Error("PUB_RETRY_EXHAUSTED",
+			zap.String("msg_id", msgID),
+			zap.Int("attempts", attempt-1),
+		)
+		return
+	}
+
+	backoff := time.Duration(math.Pow(2, float64(attempt))) * 500 * time.Millisecond
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(backoff):
+	}
+
+	pubCtx, cancel := context.WithTimeout(ctx, PublishTimeout)
+	defer cancel()
+
+	_, err := p.js.Publish(pubCtx, msg.Subject, msg.Data,
+		jetstream.WithMsgID(msgID),
+	)
+	if err != nil {
+		p.logger.Warn("PUB_RETRY_FAILED",
+			zap.String("msg_id", msgID),
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		p.retryPublish(ctx, msg, msgID, attempt+1)
+		return
+	}
+
+	p.published.Add(1)
+	p.logger.Info("PUB_RETRY_SUCCESS",
+		zap.String("msg_id", msgID),
+		zap.Int("attempt", attempt),
+	)
+}
+
+func (p *JetStreamPublisher) Stats() (published, failed, pending int64) {
+	return p.published.Load(), p.failed.Load(), p.pending.Load()
+}
+
+func (p *JetStreamPublisher) drainPending() {
+	p.logger.Info("DRAINING_PENDING_MESSAGES",
+		zap.Int64("pending", p.pending.Load()),
+	)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if p.pending.Load() == 0 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if p.pending.Load() > 0 {
+		p.logger.Warn("PENDING_MESSAGES_REMAINING",
+			zap.Int64("pending", p.pending.Load()),
+		)
+	}
+}
+
+func (p *JetStreamPublisher) Close() error {
+	p.stopped.Store(true)
+	close(p.stopCh)
+	p.wg.Wait()
+
+	if err := p.nc.Drain(); err != nil {
+		p.logger.Error("NATS_DRAIN_ERROR", zap.Error(err))
+	}
+	p.nc.Close()
+
+	p.logger.Info("JETSTREAM_PUBLISHER_CLOSED",
+		zap.Int64("published", p.published.Load()),
+		zap.Int64("failed", p.failed.Load()),
+	)
+
+	return nil
+}
