@@ -8,15 +8,19 @@ Streamlit-дашборд, подключающийся к NATS JetStream и чи
 """
 import asyncio
 import json
+import logging
 import queue
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+from alerter import start_alerter_thread
 
 # ─────────────────────────────────────────────────────────────────────
 # Конфигурация
@@ -27,7 +31,13 @@ WINDOWED_SUBJECT = "reviews.windowed"
 CONSUMER_NAME = "streamlit-dashboard"
 REFRESH_SECONDS = 5
 
+# ── Очереди: dashboard + alerter ──────────────────────────────────────
 _msg_queue: queue.Queue = queue.Queue()
+_alert_queue: queue.Queue = queue.Queue()
+
+# Логгер для алертов (отображается в sidebar)
+if "alert_log" not in st.session_state:
+    st.session_state.alert_log = []
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -64,6 +74,7 @@ async def nats_listener(nats_url: str):
                 try:
                     data = json.loads(msg.data)
                     _msg_queue.put_nowait(data)
+                    _alert_queue.put_nowait(data)
                 except json.JSONDecodeError:
                     pass
                 await msg.ack()
@@ -183,6 +194,75 @@ def histogram_review_count(df: pd.DataFrame) -> go.Figure:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Анализ аномалий (для отображения в sidebar)
+# ─────────────────────────────────────────────────────────────────────
+
+ALERT_WINDOW_SECONDS = 600   # 10 минут
+RATING_THRESHOLD = 3.0
+NEGATIVE_RATIO_THRESHOLD = 0.30
+
+
+def compute_anomalies(windows: list[dict]) -> list[str]:
+    """
+    Проверяет окна на аномалии за последние 10 минут.
+    Возвращает список коротких сообщений (без отправки Telegram).
+    """
+    if not windows:
+        return []
+
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - ALERT_WINDOW_SECONDS
+
+    # Фильтр: только последние 10 минут
+    recent = []
+    for w in windows:
+        ws = w.get("window_start")
+        if ws is None:
+            continue
+        if isinstance(ws, str):
+            try:
+                dt = datetime.fromisoformat(ws.replace("Z", "+00:00"))
+                ts = dt.timestamp()
+            except (ValueError, TypeError):
+                continue
+        elif isinstance(ws, (int, float)):
+            ts = ws / 1_000_000_000
+        else:
+            continue
+        if ts >= cutoff:
+            recent.append(w)
+
+    if not recent:
+        return []
+
+    from collections import defaultdict
+    by_product: dict[str, list[dict]] = defaultdict(list)
+    for w in recent:
+        pid = w.get("product_id")
+        if pid:
+            by_product[pid].append(w)
+
+    result: list[str] = []
+    for pid, group in by_product.items():
+        ratings = [w.get("avg_rating", 0) for w in group]
+        avg = sum(ratings) / len(ratings) if ratings else 0
+        negative = sum(1 for r in ratings if r < 3.0)
+        neg_ratio = negative / len(ratings) if ratings else 0
+
+        if avg < RATING_THRESHOLD:
+            result.append(
+                f"{pid}: ср.рейтинг {avg:.2f} (<{RATING_THRESHOLD})"
+            )
+        if neg_ratio > NEGATIVE_RATIO_THRESHOLD:
+            result.append(
+                f"{pid}: негатив {neg_ratio:.0%} "
+                f"({negative}/{len(ratings)})"
+            )
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Streamlit-интерфейс
 # ─────────────────────────────────────────────────────────────────────
 
@@ -200,12 +280,42 @@ def main():
         st.session_state.listener_started = False
     if "selected_product" not in st.session_state:
         st.session_state.selected_product = None
+    if "alerter_started" not in st.session_state:
+        st.session_state.alerter_started = False
 
     # ── Sidebar ──────────────────────────────────────────────────────
     with st.sidebar:
         st.header("🔗 Подключение")
         nats_url = st.text_input("NATS URL", value=NATS_URL)
         st.caption(f"Тема: `{WINDOWED_SUBJECT}`")
+
+        st.divider()
+        st.header("🔔 Оповещения Telegram")
+
+        bot_token = st.text_input(
+            "Bot Token",
+            value=st.session_state.get("bot_token", ""),
+            type="password",
+            key="bot_token_input",
+            help="Получить у t.me/BotFather",
+        )
+        chat_id = st.text_input(
+            "Chat ID",
+            value=st.session_state.get("chat_id", ""),
+            key="chat_id_input",
+            help="ID чата/группы для уведомлений",
+        )
+
+        # Сохраняем введённые значения в session_state
+        st.session_state.bot_token = bot_token
+        st.session_state.chat_id = chat_id
+
+        # Статус алертера
+        alert_configured = bool(bot_token and chat_id)
+        if alert_configured:
+            st.success("✅ Telegram настроен")
+        else:
+            st.warning("⚠️ Укажите Bot Token и Chat ID для алертов")
 
         st.divider()
 
@@ -224,6 +334,24 @@ def main():
             f"Всего окон: {len(st.session_state.windows)}"
         )
 
+        # ── Журнал алертов ──────────────────────────────────────────
+        if st.session_state.alert_log:
+            st.divider()
+            st.caption("📋 Последние оповещения")
+            for entry in st.session_state.alert_log[-5:]:
+                st.caption(f"🔔 {entry}")
+
+        # ── Текущие аномалии (preview без Telegram) ──────────────────
+        if has_data and total > 0:
+            st.divider()
+            st.caption("⚠️ Текущие аномалии")
+            anomalies = compute_anomalies(windows)
+            if anomalies:
+                for a in anomalies:
+                    st.caption(f"🚨 {a}")
+            else:
+                st.caption("✅ Всё в норме")
+
     # ── Запуск фонового NATS слушателя (один раз) ────────────────────
     if not st.session_state.listener_started:
         t = threading.Thread(
@@ -233,6 +361,18 @@ def main():
         )
         t.start()
         st.session_state.listener_started = True
+
+    # ── Запуск алертера (один раз) ───────────────────────────────────
+    bot_token = st.session_state.get("bot_token", "")
+    chat_id = st.session_state.get("chat_id", "")
+    if not st.session_state.alerter_started and bot_token and chat_id:
+        _alert_thread, _alert_stop = start_alerter_thread(
+            _alert_queue,
+            bot_token=bot_token,
+            chat_id=chat_id,
+        )
+        st.session_state.alerter_started = True
+        st.session_state.alert_stop = _alert_stop
 
     # ── Вычитываем свежие сообщения из очереди ───────────────────────
     new_count = 0
