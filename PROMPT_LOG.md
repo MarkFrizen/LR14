@@ -82,7 +82,7 @@
 **Промпт:** "Напиши Dockerfile для Go-сборщика отзывов (сборка multi-stage). Создай Kubernetes Deployment и Service для этого сервиса. Включи readinessProbe и livenessProbe (например, проверка через отдельный эндпоинт /health). Приведи YAML-манифесты."
 **Результат:** Создан Dockerfile для Go-сборщика отзывов
 ### Промпт 2
-**Промпт:** ""
+**Промпт:** "Добавь Horizontal Pod Autoscaler (HPA) для Go-сборщика на основе кастомной метрики – длины очереди NATS JetStream (количество необработанных сообщений в consumer). Используй Prometheus + Prometheus Adapter. Покажи конфигурацию ServiceMonitor и правило HPA."
 **Результат:** 
 ### Промпт 3
 **Промпт:** ""
