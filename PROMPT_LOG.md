@@ -50,10 +50,10 @@
 ## Задание  3: Передача данных через Apache Arrow.
 ### Промпт 1
 **Промпт:** "Напиши Go-сервер с использованием Apache Arrow Flight RPC. Сервер должен отдавать предварительно агрегированные данные (структура WindowAgg) в формате RecordBatch. Колонки: product_id (string), window_start (timestamp), avg_rating (float64), total_likes (int64), review_count (int64). Покажи, как создать FlightServer с одним методом GetWindows()."
-**Результат:** 
+**Результат:** Написан Go-сервер internal/arrowserver/server.go
 ### Промпт 2
-**Промпт:** ""
-**Результат:** 
+**Промпт:** "Напиши Python-клиент, который подключается к Go-серверу Arrow Flight, получает RecordBatch и преобразует его в Polars DataFrame без копирования. Выведи первые 5 строк и схему. Сравни время выполнения и объём переданных данных с передачей через JSON (замерь через time и sys.getsizeof)."
+**Результат:** Создан файл: clients/arrow_client.py
 ### Промпт 3
 **Промпт:** ""
 **Результат:** 
