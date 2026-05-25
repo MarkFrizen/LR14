@@ -1,0 +1,39 @@
+# ── Go ──────────────────────────────────────────────
+*.exe
+*.exe~
+*.test
+*.out
+collector
+collector.exe
+
+# ── Rust ────────────────────────────────────────────
+rust-validator/target/
+py-validator/target/
+
+# ── Python ──────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── IDE ─────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# ── OS ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Benchmark artifacts ─────────────────────────────
+benchmark_results_*.json
+cmd/benchmark-validate/benchmark_results*.json
+cmd/benchmark-validate/benchmark_comparison.png
+
+# ── Docker ──────────────────────────────────────────
+.dockerignore
