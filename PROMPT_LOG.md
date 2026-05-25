@@ -49,7 +49,7 @@
 
 ## Задание  3: Передача данных через Apache Arrow.
 ### Промпт 1
-**Промпт:** ""
+**Промпт:** "Напиши Go-сервер с использованием Apache Arrow Flight RPC. Сервер должен отдавать предварительно агрегированные данные (структура WindowAgg) в формате RecordBatch. Колонки: product_id (string), window_start (timestamp), avg_rating (float64), total_likes (int64), review_count (int64). Покажи, как создать FlightServer с одним методом GetWindows()."
 **Результат:** 
 ### Промпт 2
 **Промпт:** ""
