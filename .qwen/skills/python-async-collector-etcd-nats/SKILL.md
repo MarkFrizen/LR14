@@ -1,8 +1,8 @@
 ---
 name: python-async-collector-etcd-nats
-description: Шаблон портирования Go-сервиса (etcd-координация + NATS JetStream) на Python asyncio с имитацией внешних API
+description: Шаблон портирования Go-сервиса (etcd-координация + NATS JetStream) на Python asyncio, включая сбор метрик производительности (psutil + CSV) и бенчмаркинг Go vs Python
 source: auto-skill
-extracted_at: '2026-05-28T12:57:43.840Z'
+extracted_at: '2026-05-28T16:10:00.000Z'
 ---
 
 # Python async collector: портирование Go-сервиса с etcd + NATS
@@ -187,11 +187,127 @@ formatter = logging.Formatter(
 
 Ключи событий — UPPER_SNAKE_CASE (как в Go: `PRODUCT_CLAIMED`, `COLLECTOR_STARTED`), экстра-поля — через `extra={}`.
 
+### 8. Сбор метрик производительности (psutil + CSV)
+
+Добавляется `MetricsCollector`, который работает как фоновый asyncio-цикл и каждые N секунд снимает снимок:
+
+```python
+import psutil
+
+class MetricsCollector:
+    def __init__(self, csv_path: str, interval: float = 5.0, logger=None):
+        self.csv_path = Path(csv_path)
+        self.interval = interval
+        self.process = psutil.Process()
+        self.total_reviews = 0
+        self._snapshots = []
+        # CSV header: timestamp, elapsed_s, total_reviews, reviews_per_sec, rss_mb, cpu_percent
+
+    async def start(self):
+        self._start_time = time.time()
+        self._task = asyncio.create_task(self._run_loop())
+
+    async def _run_loop(self):
+        while True:
+            await asyncio.sleep(self.interval)
+            snapshot = self._take_snapshot()
+            self._snapshots.append(snapshot)
+            self._append_csv(snapshot)
+
+    def record_reviews(self, count: int = 1):
+        """Вызывается из collect_loop при получении отзывов."""
+        self.total_reviews += count
+
+    def _take_snapshot(self):
+        now = time.time()
+        delta_reviews = self.total_reviews - self._prev_reviews
+        rps = delta_reviews / (now - self._prev_time)
+        rss_mb = self.process.memory_info().rss / 1024 / 1024
+        cpu_pct = self.process.cpu_percent(interval=0)
+        # ...
+        return MetricsSnapshot(...)
+
+    def get_summary(self) -> dict:
+        """Усредняет все снимки → avg_rps, peak_rps, avg_rss_mb, peak_rss_mb, ..."""
+```
+
+**Интеграция в Collector.** `MetricsCollector` передаётся в конструктор и вызывается после каждого батча:
+
+```python
+class Collector:
+    def __init__(self, ..., metrics: MetricsCollector | None = None):
+        self.metrics = metrics
+
+    async def _collect_loop(self):
+        reviews = await self.market.fetch_reviews(pid, limit)
+        if self.metrics:
+            self.metrics.record_reviews(len(reviews))
+```
+
+**Важно:** `psutil.cpu_percent(interval=0)` возвращает мгновенное значение, которое для коротких (<5с) процессов часто равно 0. Для точного CPU используйте `interval=0.1` или запускайте метрики до начала работы и останавливайте после.
+
+### 9. Benchmark-режим (без etcd/NATS)
+
+Для сравнения производительности Go vs Python создаётся параллельный benchmark-режим:
+
+```python
+async def run_benchmark(
+    num_products=1000, reviews_per_product=50, concurrency=50,
+    csv_path="metrics_python.csv"
+) -> dict:
+    metrics = MetricsCollector(csv_path=csv_path, interval=5.0)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(pid: str) -> int:
+        async with sem:
+            delay = 0.05 + random.random() * 0.15  # имитация HTTP
+            await asyncio.sleep(delay)
+            # генерация ровно reviews_per_product отзывов
+            for i in range(reviews_per_product):
+                _ = Review(...)
+            metrics.record_reviews(reviews_per_product)
+            return reviews_per_product
+
+    await metrics.start()
+    tasks = [asyncio.create_task(fetch_one(pid)) for pid in product_ids]
+    await asyncio.gather(*tasks)
+    await metrics.stop()
+
+    return metrics.get_summary()
+```
+
+**Принцип:** прямой сбор отзывов, без etcd и NATS — измеряется чистая скорость генерации + pipeline. Для Go делается идентичная программа, использующая тот же `marketplace.Simulator` и `runtime.ReadMemStats` для замера памяти.
+
+### 10. Сравнение Go vs Python (методология)
+
+| Аспект | Go | Python |
+|---|---|---|
+| Параллелизм | goroutines + buffered channel semaphore | asyncio + Semaphore |
+| Генерация отзывов | `marketplace.Simulator.FetchReviews` | `MarketSimulator.fetch_reviews` |
+| Задержка | `time.Sleep(50-200ms)` | `await asyncio.sleep(0.05-0.15)` |
+| Замер памяти | `runtime.ReadMemStats().Alloc` | `psutil.Process().memory_info().rss` |
+| Вывод результатов | JSON summary через `SUMMARY_JSON:` | JSON summary через `SUMMARY_JSON:` |
+
+**Ключевые метрики для сравнения:**
+- **Wall clock time** (сек) — общая длительность
+- **Throughput** (reviews/sec) — общее количество / wall time
+- **Peak memory** (MB) — `runtime.Alloc` (Go heap) vs `psutil RSS` (Python полный процесс)
+- **CPU usage** — только для длительных (>10s) прогонов
+
+**Результаты типичного сравнения (1000 продуктов × 50 отзывов = 50 000, concurrency=50):**
+``` 
+Go:        2.61s, ~19100 rev/s, alloc=3.4MB
+Python:    2.63s, ~19000 rev/s, RSS=38.2MB
+```
+
+Разница <1% по скорости объясняется тем, что доминирующий фактор — симулированная сетевая задержка (50-200ms/product), которая нивелирует различия рантаймов. Python потребляет больше памяти (~5-10×), т.к. RSS включает весь интерпретатор.
+
 ## Зависимости (requirements.txt)
 
 ```
 aiohttp>=3.9.0      # HTTP-клиент (etcd API + внешние API)
 nats-py>=2.6.0      # NATS JetStream
+psutil>=5.9.0       # метрики (RSS, CPU) — опционально, только для бенчмарков
 ```
 
 Никаких дополнительных etcd-клиентских библиотек не требуется — etcd HTTP v3 API покрывает все необходимые операции.

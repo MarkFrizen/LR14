@@ -16,17 +16,21 @@ Python-сборщик отзывов с маркетплейса (аналог G
 import argparse
 import asyncio
 import base64
+import csv
 import json
 import logging
 import os
 import random
 import signal
+import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import psutil
 
 
 # ====================================================================
@@ -43,6 +47,176 @@ class Review:
     likes: int
     dislikes: int
     date: str  # ISO 8601
+
+
+# ====================================================================
+# 1b. Сборщик метрик производительности (psutil + CSV)
+# ====================================================================
+
+@dataclass
+class MetricsSnapshot:
+    """Снимок метрик в один момент времени."""
+    timestamp: float       # unix seconds
+    elapsed: float         # seconds since start
+    total_reviews: int
+    reviews_per_sec: float # за последний интервал
+    rss_mb: float          # Resident Set Size в MB
+    cpu_percent: float     # CPU процесса (% от одного ядра)
+
+
+class MetricsCollector:
+    """Фоновый сбор метрик: psutil + CSV-логирование каждые N секунд.
+
+    Аналог Go: runtime.ReadMemStats + Prometheus, но в упрощённом виде.
+    """
+
+    def __init__(self, csv_path: str, interval: float = 5.0,
+                 logger: logging.Logger | None = None):
+        self.csv_path = Path(csv_path)
+        self.interval = interval
+        self.logger = logger or logging.getLogger("metrics")
+        self.process = psutil.Process()
+        self._task: asyncio.Task | None = None
+
+        # Счётчики
+        self.total_reviews: int = 0
+        self._prev_reviews: int = 0
+        self._prev_time: float = 0.0
+        self._start_time: float = 0.0
+
+        # Для скользящего RPS (за последние interval секунд)
+        self._rps_window: list[tuple[float, int]] = []  # (time, cumulative)
+
+        self._snapshots: list[MetricsSnapshot] = []
+
+        # Инициализация CSV (заголовок)
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.csv_path.exists():
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "timestamp", "elapsed_s",
+                    "total_reviews", "reviews_per_sec",
+                    "rss_mb", "cpu_percent",
+                ])
+
+    def record_reviews(self, count: int = 1):
+        """Увеличивает счётчик собранных отзывов."""
+        self.total_reviews += count
+
+    async def start(self):
+        """Запускает фоновый цикл снятия метрик."""
+        self._start_time = time.time()
+        self._prev_time = self._start_time
+        self._task = asyncio.create_task(self._run_loop())
+        if self.logger:
+            self.logger.info(
+                "METRICS_STARTED",
+                extra={"csv": str(self.csv_path), "interval": self.interval},
+            )
+
+    async def _run_loop(self):
+        """Цикл: измерение → запись CSV → ожидание."""
+        while True:
+            await asyncio.sleep(self.interval)
+            try:
+                snapshot = self._take_snapshot()
+                self._snapshots.append(snapshot)
+                self._append_csv(snapshot)
+                if self.logger:
+                    self.logger.info(
+                        "METRICS",
+                        extra={
+                            "rps": f"{snapshot.reviews_per_sec:.1f}",
+                            "rss_mb": f"{snapshot.rss_mb:.1f}",
+                            "cpu": f"{snapshot.cpu_percent:.1f}%",
+                            "total": snapshot.total_reviews,
+                        },
+                    )
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning("METRICS_ERROR", extra={"error": str(e)})
+
+    def _take_snapshot(self) -> MetricsSnapshot:
+        """Делает снимок текущих метрик."""
+        now = time.time()
+        elapsed = now - self._start_time
+        interval_dt = now - self._prev_time
+
+        # Прирост отзывов за интервал → RPS
+        delta_reviews = self.total_reviews - self._prev_reviews
+        rps = delta_reviews / interval_dt if interval_dt > 0 else 0.0
+
+        # Память и CPU
+        try:
+            rss_mb = self.process.memory_info().rss / 1024 / 1024
+        except Exception:
+            rss_mb = 0.0
+        try:
+            cpu_pct = self.process.cpu_percent(interval=0)
+        except Exception:
+            cpu_pct = 0.0
+
+        # Обновляем предыдущие значения
+        self._prev_reviews = self.total_reviews
+        self._prev_time = now
+
+        return MetricsSnapshot(
+            timestamp=now,
+            elapsed=elapsed,
+            total_reviews=self.total_reviews,
+            reviews_per_sec=rps,
+            rss_mb=rss_mb,
+            cpu_percent=cpu_pct,
+        )
+
+    def _append_csv(self, s: MetricsSnapshot):
+        """Дописывает одну строку в CSV."""
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                f"{s.timestamp:.3f}",
+                f"{s.elapsed:.3f}",
+                s.total_reviews,
+                f"{s.reviews_per_sec:.2f}",
+                f"{s.rss_mb:.2f}",
+                f"{s.cpu_percent:.2f}",
+            ])
+
+    def get_summary(self) -> dict:
+        """Возвращает сводку по всем снимкам (средние, пиковые значения)."""
+        if not self._snapshots:
+            return {}
+        rps_vals = [s.reviews_per_sec for s in self._snapshots]
+        rss_vals = [s.rss_mb for s in self._snapshots]
+        cpu_vals = [s.cpu_percent for s in self._snapshots]
+        return {
+            "duration_s": self._snapshots[-1].elapsed,
+            "total_reviews": self._snapshots[-1].total_reviews,
+            "avg_rps": sum(rps_vals) / len(rps_vals),
+            "peak_rps": max(rps_vals),
+            "avg_rss_mb": sum(rss_vals) / len(rss_vals),
+            "peak_rss_mb": max(rss_vals),
+            "avg_cpu_pct": sum(cpu_vals) / len(cpu_vals),
+            "peak_cpu_pct": max(cpu_vals),
+        }
+
+    async def stop(self):
+        """Останавливает сбор метрик."""
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        # Финальный снимок
+        if self.total_reviews > 0:
+            final = self._take_snapshot()
+            self._snapshots.append(final)
+            self._append_csv(final)
+        if self.logger:
+            summary = self.get_summary()
+            self.logger.info("METRICS_FINAL", extra=summary)
 
 
 # ====================================================================
@@ -430,6 +604,7 @@ class Collector:
         worker_id: str,
         source: str,
         logger: logging.Logger,
+        metrics: MetricsCollector | None = None,
     ):
         self.etcd = EtcdClient(etcd_endpoints, logger)
         self.market = MarketSimulator(source)
@@ -437,6 +612,7 @@ class Collector:
         self.worker_id = worker_id
         self.source = source
         self.logger = logger
+        self.metrics = metrics
 
         self._owned_products: dict[str, str] = {}  # product_id → status
         self._shutdown = asyncio.Event()
@@ -587,6 +763,9 @@ class Collector:
                             self.logger.warning("COLLECT_SKIP_REVIEW",
                                                 extra={"review_id": review.id})
 
+                    if self.metrics:
+                        self.metrics.record_reviews(len(reviews))
+
                     self._owned_products[pid] = "completed"
                     self.logger.info("PRODUCT_COLLECTED",
                                      extra={"product": pid,
@@ -644,7 +823,100 @@ class Collector:
 
 
 # ====================================================================
-# 6. Main + graceful shutdown
+# 6. Benchmark-режим (без etcd/NATS, прямая загрузка)
+# ====================================================================
+
+async def run_benchmark(
+    num_products: int = 1000,
+    reviews_per_product: int = 50,
+    source: str = "wildberries",
+    concurrency: int = 50,
+    csv_path: str = "metrics_python.csv",
+    logger: logging.Logger | None = None,
+) -> dict:
+    """Запускает сборщик в benchmark-режиме и возвращает сводку метрик.
+
+    Args:
+        num_products: количество product_id (по умолч. 1000)
+        reviews_per_product: отзывов на товар (по умолч. 50)
+        source: источник ("wildberries" / "ozon")
+        concurrency: число параллельных корутин (semaphore)
+        csv_path: путь к CSV-файлу метрик
+
+    Returns:
+        Словарь со сводкой: duration_s, total_reviews, avg_rps, peak_rps,
+        avg_rss_mb, peak_rss_mb, avg_cpu_pct, peak_cpu_pct
+    """
+    logger = logger or logging.getLogger("benchmark")
+    market = MarketSimulator(source)
+    metrics = MetricsCollector(csv_path=csv_path, interval=5.0, logger=logger)
+
+    # Генерация product_id
+    product_ids = [f"BENCH-{i:04d}" for i in range(num_products)]
+    total_expected = num_products * reviews_per_product
+    logger.info("BENCH_START",
+                extra={"products": num_products,
+                       "reviews_per_product": reviews_per_product,
+                       "total_expected": total_expected,
+                       "concurrency": concurrency})
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(pid: str) -> int:
+        """Собирает ровно reviews_per_product отзывов для одного товара."""
+        async with sem:
+            # Симулируем задержку HTTP-запроса (как в MarketSimulator)
+            delay = 0.05 + random.random() * 0.15
+            await asyncio.sleep(delay)
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            for i in range(reviews_per_product):
+                rating = 1 + random.randint(0, 4)
+                likes = random.randint(0, 49)
+                dislikes = random.randint(0, 19)
+                hours_ago = random.randint(0, 719)
+                review_date = now - timedelta(hours=hours_ago)
+
+                _ = Review(
+                    id=f"{source}-{pid}-{i}",
+                    product_id=pid,
+                    rating=rating,
+                    text=random.choice(market.REVIEW_TEXTS[rating]),
+                    likes=likes,
+                    dislikes=dislikes,
+                    date=review_date.isoformat(),
+                )
+            metrics.record_reviews(reviews_per_product)
+            return reviews_per_product
+
+    # Запуск метрик и сбор
+    await metrics.start()
+    start_wall = time.monotonic()
+
+    tasks = [asyncio.create_task(fetch_one(pid)) for pid in product_ids]
+    results = await asyncio.gather(*tasks)
+
+    elapsed_wall = time.monotonic() - start_wall
+    await metrics.stop()
+
+    total = sum(results)
+    summary = metrics.get_summary()
+    summary["wall_clock_s"] = elapsed_wall
+
+    logger.info("BENCH_DONE",
+                extra={
+                    "total_reviews": total,
+                    "wall_clock_s": f"{elapsed_wall:.2f}",
+                    "avg_rps": f"{summary.get('avg_rps', 0):.1f}",
+                    "peak_rss_mb": f"{summary.get('peak_rss_mb', 0):.1f}",
+                    "avg_cpu": f"{summary.get('avg_cpu_pct', 0):.1f}%",
+                })
+
+    return summary
+
+
+# ====================================================================
+# 7. Main + graceful shutdown
 # ====================================================================
 
 def setup_logging() -> logging.Logger:
@@ -683,10 +955,80 @@ async def async_main():
     parser.add_argument("--source", default="wildberries",
                         choices=["wildberries", "ozon"],
                         help="marketplace source")
+    parser.add_argument("--metrics-csv", default="",
+                        help="path to metrics CSV (empty = no metrics)")
+    parser.add_argument("--metrics-interval", type=float, default=5.0,
+                        help="metrics sampling interval (seconds)")
+
+    # Benchmark mode
+    parser.add_argument("--bench", action="store_true",
+                        help="run in benchmark mode (no etcd/NATS)")
+    parser.add_argument("--bench-products", type=int, default=1000,
+                        help="number of products in benchmark")
+    parser.add_argument("--bench-reviews", type=int, default=50,
+                        help="reviews per product in benchmark")
+    parser.add_argument("--bench-concurrency", type=int, default=50,
+                        help="concurrent coroutines in benchmark")
     args = parser.parse_args()
 
     logger = setup_logging()
+
+    # ── Benchmark mode ──────────────────────────────────────────────
+    if args.bench:
+        csv_path = args.metrics_csv or "metrics_python.csv"
+        summary = await run_benchmark(
+            num_products=args.bench_products,
+            reviews_per_product=args.bench_reviews,
+            source=args.source,
+            concurrency=args.bench_concurrency,
+            csv_path=csv_path,
+            logger=logger,
+        )
+        print(f"\n{'='*60}")
+        print("  PYTHON BENCHMARK RESULTS")
+        print(f"{'='*60}")
+        print(f"  Duration:          {summary.get('wall_clock_s', 0):>8.2f} s")
+        print(f"  Total reviews:     {summary.get('total_reviews', 0):>8}")
+        print(f"  Avg throughput:    {summary.get('avg_rps', 0):>8.1f} rev/s")
+        print(f"  Peak throughput:   {summary.get('peak_rps', 0):>8.1f} rev/s")
+        print(f"  Avg RSS:           {summary.get('avg_rss_mb', 0):>8.1f} MB")
+        print(f"  Peak RSS:          {summary.get('peak_rss_mb', 0):>8.1f} MB")
+        print(f"  Avg CPU:           {summary.get('avg_cpu_pct', 0):>8.1f} %")
+        print(f"  Peak CPU:          {summary.get('peak_cpu_pct', 0):>8.1f} %")
+        print(f"{'='*60}")
+        print(f"  Metrics saved to:  {csv_path}")
+        print(f"{'='*60}\n")
+
+        # JSON для парсинга скриптом сравнения
+        import json as _json
+        total_expected = args.bench_products * args.bench_reviews
+        print("SUMMARY_JSON:", end="")
+        print(_json.dumps({
+            "language": "python",
+            "wall_clock_s": round(summary.get("wall_clock_s", 0), 2),
+            "total_reviews": summary.get("total_reviews", 0),
+            "products": args.bench_products,
+            "expected_total": total_expected,
+            "rps": round(summary.get("avg_rps", 0), 1),
+            "peak_rps": round(summary.get("peak_rps", 0), 1),
+            "avg_rss_mb": round(summary.get("avg_rss_mb", 0), 1),
+            "peak_rss_mb": round(summary.get("peak_rss_mb", 0), 1),
+            "avg_cpu_pct": round(summary.get("avg_cpu_pct", 0), 1),
+            "peak_cpu_pct": round(summary.get("peak_cpu_pct", 0), 1),
+        }))
+        print()
+        return
+
+    # ── Normal mode ─────────────────────────────────────────────────
     etcd_endpoints = [ep.strip() for ep in args.etcd.split(",")]
+
+    metrics = None
+    if args.metrics_csv:
+        metrics = MetricsCollector(
+            csv_path=args.metrics_csv,
+            interval=args.metrics_interval,
+            logger=logger,
+        )
 
     collector = Collector(
         etcd_endpoints=etcd_endpoints,
@@ -694,6 +1036,7 @@ async def async_main():
         worker_id=args.worker,
         source=args.source,
         logger=logger,
+        metrics=metrics,
     )
 
     # Signal handling (асинхронный, неблокирующий).
@@ -708,10 +1051,11 @@ async def async_main():
         try:
             loop.add_signal_handler(sig, _on_signal)
         except NotImplementedError:
-            # Windows или другая платформа без add_signal_handler
             pass
 
     try:
+        if metrics:
+            await metrics.start()
         await collector.start()
         logger.info("COLLECTOR_READY",
                     extra={"worker": args.worker, "source": args.source})
@@ -719,6 +1063,8 @@ async def async_main():
         await shutdown_event.wait()
 
         await collector.stop()
+        if metrics:
+            await metrics.stop()
     except Exception as e:
         logger.error("FATAL_ERROR", extra={"error": str(e)})
         raise
