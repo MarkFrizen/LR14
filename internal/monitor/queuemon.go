@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/markfriz/wb-ozon-review-collector/internal/natspub"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -36,7 +37,7 @@ func NewMetrics() *Metrics {
 
 // QueueMonitor периодически опрашивает NATS JetStream и обновляет метрики.
 type QueueMonitor struct {
-	js      jetstream.JetStream
+	js      natspub.JetStreamClient
 	metrics *Metrics
 	logger  *zap.Logger
 	stream  string
@@ -47,11 +48,11 @@ type QueueMonitor struct {
 // NewQueueMonitor создаёт монитор очереди NATS JetStream.
 //
 // Параметры:
-//   - js: JetStream-контекст (из *nats.Conn)
+//   - js: JetStream-клиент
 //   - stream: имя JetStream-стрима
 //   - consumers: имена consumer'ов, чью pending-очередь отслеживать
 //   - logger: логгер
-func NewQueueMonitor(js jetstream.JetStream, stream string, consumers []string, logger *zap.Logger) *QueueMonitor {
+func NewQueueMonitor(js natspub.JetStreamClient, stream string, consumers []string, logger *zap.Logger) *QueueMonitor {
 	return &QueueMonitor{
 		js:        js,
 		metrics:   NewMetrics(),
@@ -122,7 +123,7 @@ func (qm *QueueMonitor) poll(ctx context.Context) {
 // MustRegisterConsumer пытается создать/найти consumer на стриме.
 // Если consumer уже существует — использует его.
 // Возвращает имя consumer'а.
-func MustRegisterConsumer(ctx context.Context, js jetstream.JetStream, stream, consumerName, filterSubject string, logger *zap.Logger) (jetstream.Consumer, error) {
+func MustRegisterConsumer(ctx context.Context, js natspub.JetStreamClient, stream, consumerName, filterSubject string, logger *zap.Logger) (jetstream.Consumer, error) {
 	// Пробуем найти существующего.
 	existing, err := js.Consumer(ctx, stream, consumerName)
 	if err == nil {

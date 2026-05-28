@@ -16,6 +16,27 @@ import (
 	"go.uber.org/zap"
 )
 
+// NATSConnection определяет контракт для подключения к NATS.
+type NATSConnection interface {
+	Drain() error
+	Close()
+}
+
+// JetStreamClient определяет контракт для операций JetStream.
+type JetStreamClient interface {
+	CreateOrUpdateStream(ctx context.Context, config jetstream.StreamConfig) (jetstream.Stream, error)
+	PublishAsync(subject string, data []byte, opts ...jetstream.PublishOpt) (jetstream.PubAckFuture, error)
+	Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error)
+	Consumer(ctx context.Context, stream, consumer string) (jetstream.Consumer, error)
+	CreateOrUpdateConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, error)
+}
+
+// natsConnAdapter адаптирует *nats.Conn к NATSConnection.
+type natsConnAdapter struct{ conn *nats.Conn }
+
+func (a *natsConnAdapter) Drain() error { return a.conn.Drain() }
+func (a *natsConnAdapter) Close()       { a.conn.Close() }
+
 const (
 	StreamName          = "reviews"
 	RawSubject          = "reviews.raw"
@@ -29,8 +50,8 @@ const (
 
 // JetStreamPublisher публикует данные в NATS JetStream с exactly-once доставкой.
 type JetStreamPublisher struct {
-	nc     *nats.Conn
-	js     jetstream.JetStream
+	nc     NATSConnection
+	js     JetStreamClient
 	logger *zap.Logger
 
 	pubAckCh chan jetstream.PubAckFuture
@@ -44,23 +65,7 @@ type JetStreamPublisher struct {
 	stopped atomic.Bool
 }
 
-func NewJetStreamPublisher(ctx context.Context, urls string, logger *zap.Logger) (*JetStreamPublisher, error) {
-	nc, err := nats.Connect(urls,
-		nats.Name("review-collector"),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
-		nats.Timeout(5*time.Second),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("nats connect: %w", err)
-	}
-
-	js, err := jetstream.New(nc)
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("jetstream new: %w", err)
-	}
+func NewJetStreamPublisher(ctx context.Context, nc NATSConnection, js JetStreamClient, logger *zap.Logger) (*JetStreamPublisher, error) {
 
 	p := &JetStreamPublisher{
 		nc:       nc,
@@ -79,12 +84,33 @@ func NewJetStreamPublisher(ctx context.Context, urls string, logger *zap.Logger)
 	go p.ackLoop(ctx)
 
 	logger.Info("JETSTREAM_PUBLISHER_READY",
-		zap.String("urls", urls),
 		zap.String("stream", StreamName),
 		zap.Strings("subjects", []string{RawSubject, WindowedSubject}),
 	)
 
 	return p, nil
+}
+
+// NewNATSClient создаёт подключение к NATS и JetStream клиент, обёрнутые в интерфейсы.
+func NewNATSClient(ctx context.Context, urls string, logger *zap.Logger) (NATSConnection, JetStreamClient, error) {
+	nc, err := nats.Connect(urls,
+		nats.Name("review-collector"),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.Timeout(5*time.Second),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("nats connect: %w", err)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return nil, nil, fmt.Errorf("jetstream new: %w", err)
+	}
+
+	return &natsConnAdapter{conn: nc}, js, nil
 }
 
 func (p *JetStreamPublisher) initStream(ctx context.Context) error {
@@ -234,7 +260,7 @@ func (p *JetStreamPublisher) Stats() (published, failed, pending int64) {
 }
 
 // JetStream возвращает JetStream-контекст для внешних компонентов (например, монитора очереди).
-func (p *JetStreamPublisher) JetStream() jetstream.JetStream {
+func (p *JetStreamPublisher) JetStream() JetStreamClient {
 	return p.js
 }
 

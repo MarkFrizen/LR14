@@ -11,6 +11,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// EtcdStorage определяет контракт для операций с etcd, используемых Coordinator.
+// Позволяет подменить реализацию etcd для тестирования.
+type EtcdStorage interface {
+	Grant(ctx context.Context, ttl int64) (*clientv3.LeaseGrantResponse, error)
+	KeepAlive(ctx context.Context, leaseID clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error)
+	Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error)
+	Watch(ctx context.Context, prefix string, opts ...clientv3.OpOption) clientv3.WatchChan
+	Delete(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.DeleteResponse, error)
+	Txn(ctx context.Context) clientv3.Txn
+	Revoke(ctx context.Context, leaseID clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error)
+	Close() error
+}
+
 const (
 	etcdKeyPrefix       = "/collector"
 	productListPrefix   = etcdKeyPrefix + "/products/"
@@ -40,7 +53,7 @@ type ShardInfo struct {
 
 // Coordinator управляет распределением product_id между воркерами через etcd.
 type Coordinator struct {
-	cli      *clientv3.Client
+	cli      EtcdStorage
 	leaseID  clientv3.LeaseID
 	workerID string
 	logger   *zap.Logger
@@ -56,24 +69,12 @@ type Coordinator struct {
 	lostProducts chan string
 }
 
-// NewCoordinator создаёт подключение к etcd, лизинг и запускает keepalive.
-func NewCoordinator(ctx context.Context, endpoints []string, workerID string) (*Coordinator, error) {
-	logger, err := zap.NewProduction()
-	if err != nil {
-		return nil, fmt.Errorf("new logger: %w", err)
-	}
-
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second,
-		Logger:      logger,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("etcd client: %w", err)
-	}
+// NewCoordinator создаёт Coordinator с переданным EtcdStorage.
+// Лизинг создаётся автоматически при инициализации.
+func NewCoordinator(ctx context.Context, cli EtcdStorage, workerID string, logger *zap.Logger) (*Coordinator, error) {
 
 	// Создаём лизинг.
-	resp, err := cli.Grant(ctx, LeaseTTL)
+	resp, err := cli.Grant(ctx, int64(LeaseTTL))
 	if err != nil {
 		cli.Close()
 		return nil, fmt.Errorf("grant lease: %w", err)

@@ -16,6 +16,7 @@ import (
 	"github.com/markfriz/wb-ozon-review-collector/internal/coordinator"
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
 	"github.com/markfriz/wb-ozon-review-collector/internal/natspub"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 )
 
@@ -49,7 +50,16 @@ func main() {
 	endpoints := splitEndpoints(*etcdEndpoints)
 	logger.Info("CONNECTING_TO_ETCD", zap.Strings("endpoints", endpoints))
 
-	coord, err := coordinator.NewCoordinator(ctx, endpoints, *workerID)
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints:   endpoints,
+		DialTimeout: 5 * time.Second,
+		Logger:      logger,
+	})
+	if err != nil {
+		log.Fatalf("FAILED to create etcd client: %v", err)
+	}
+
+	coord, err := coordinator.NewCoordinator(ctx, etcdCli, *workerID, logger)
 	if err != nil {
 		log.Fatalf("FAILED to create coordinator: %v", err)
 	}
@@ -99,7 +109,11 @@ func main() {
 
 	// NATS publisher — публикует окна для Python-аналитика.
 	logger.Info("CONNECTING_TO_NATS", zap.String("url", *natsURL))
-	publisher, err := natspub.NewJetStreamPublisher(ctx, *natsURL, logger)
+	nc, js, err := natspub.NewNATSClient(ctx, *natsURL, logger)
+	if err != nil {
+		log.Fatalf("FAILED to create NATS client: %v", err)
+	}
+	publisher, err := natspub.NewJetStreamPublisher(ctx, nc, js, logger)
 	if err != nil {
 		log.Fatalf("FAILED to create NATS publisher: %v", err)
 	}

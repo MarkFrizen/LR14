@@ -5,7 +5,10 @@ edition = "2021"
 
 [lib]
 name = "py_review_validator"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
-pyo3 = { version = "0.22.6", features = ["extension-module"] }
+pyo3 = { version = "0.22.6", features = ["extension-module", "auto-initialize"] }
+
+[build-dependencies]
+pyo3-build-config = "0.22.6"

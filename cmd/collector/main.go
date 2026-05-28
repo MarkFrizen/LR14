@@ -20,6 +20,7 @@ import (
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
 	"github.com/markfriz/wb-ozon-review-collector/internal/monitor"
 	"github.com/markfriz/wb-ozon-review-collector/internal/natspub"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
@@ -60,7 +61,16 @@ func main() {
 		zap.String("worker", *workerID),
 	)
 
-	coord, err := coordinator.NewCoordinator(ctx, endpoints, *workerID)
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints:   endpoints,
+		DialTimeout: 5 * time.Second,
+		Logger:      logger,
+	})
+	if err != nil {
+		log.Fatalf("FAILED to create etcd client: %v", err)
+	}
+
+	coord, err := coordinator.NewCoordinator(ctx, etcdCli, *workerID, logger)
 	if err != nil {
 		log.Fatalf("FAILED to create coordinator: %v", err)
 	}
@@ -141,13 +151,11 @@ func main() {
 	// ========================================================================
 	// 4. NATS JetStream — публикатор агрегированных окон
 	// ========================================================================
-	logger.Info("CONNECTING_TO_NATS",
-		zap.String("url", *natsURL),
-		zap.String("stream", natspub.StreamName),
-		zap.String("subject", natspub.WindowedSubject),
-	)
-
-	publisher, err := natspub.NewJetStreamPublisher(ctx, *natsURL, logger)
+	ncConn, jsClient, err := natspub.NewNATSClient(ctx, *natsURL, logger)
+	if err != nil {
+		log.Fatalf("FAILED to create NATS client: %v", err)
+	}
+	publisher, err := natspub.NewJetStreamPublisher(ctx, ncConn, jsClient, logger)
 	if err != nil {
 		log.Fatalf("FAILED to create NATS publisher: %v", err)
 	}
@@ -202,14 +210,14 @@ func main() {
 	// 4b. Prometheus-монитор очереди NATS JetStream
 	// ========================================================================
 	const consumerName = "review-collector-worker"
-	js := publisher.JetStream()
+	jsMon := publisher.JetStream()
 
-	_, err = monitor.MustRegisterConsumer(ctx, js, natspub.StreamName, consumerName, natspub.RawSubject, logger)
+	_, err = monitor.MustRegisterConsumer(ctx, jsMon, natspub.StreamName, consumerName, natspub.RawSubject, logger)
 	if err != nil {
 		logger.Warn("CONSUMER_REGISTRATION_FAILED", zap.Error(err))
 	}
 
-	qm := monitor.NewQueueMonitor(js, natspub.StreamName, []string{consumerName}, logger)
+	qm := monitor.NewQueueMonitor(jsMon, natspub.StreamName, []string{consumerName}, logger)
 	go qm.Run(ctx)
 
 	logger.Info("PIPELINE_STARTED",

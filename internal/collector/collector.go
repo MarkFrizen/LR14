@@ -6,11 +6,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/markfriz/wb-ozon-review-collector/internal/coordinator"
-	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
 	"github.com/markfriz/wb-ozon-review-collector/internal/models"
 	"go.uber.org/zap"
 )
+
+// Coordinator определяет контракт для управления шардами товаров через etcd.
+type Coordinator interface {
+	ClaimProducts(ctx context.Context) ([]string, error)
+	TryClaimOne(ctx context.Context, productID string) (bool, error)
+	LostProducts() <-chan string
+	WatchAssignmentChanges(ctx context.Context) (<-chan string, error)
+	StartOwnershipChecker(ctx context.Context)
+	OwnedProducts() []string
+	MarkProductCollected(productID string)
+	BootstrapProducts(ctx context.Context, products []string) error
+}
+
+// Marketplace определяет контракт для получения отзывов с маркетплейса.
+type Marketplace interface {
+	FetchReviews(ctx context.Context, productID string, limit int) ([]models.Review, error)
+}
 
 // workerState отслеживает состояние горутины, обрабатывающей один product_id.
 type workerState struct {
@@ -19,12 +34,15 @@ type workerState struct {
 	done      chan struct{}
 }
 
+// reclaimInterval — интервал между попытками захвата освободившихся шардов.
+const reclaimInterval = 15 // секунд
+
 // Collector собирает отзывы с маркетплейса, распределяя шарды через etcd.
 // Собранные отзывы отправляются в локальный канал Reviews() для последующей
 // оконной агрегации. Сырые отзывы больше не публикуются в NATS напрямую.
 type Collector struct {
-	coord   *coordinator.Coordinator
-	market  *marketplace.Simulator
+	coord   Coordinator
+	market  Marketplace
 	logger  *zap.Logger
 	reviews chan models.Review
 
@@ -35,7 +53,7 @@ type Collector struct {
 }
 
 // New создаёт новый сборщик.
-func New(coord *coordinator.Coordinator, market *marketplace.Simulator) *Collector {
+func New(coord Coordinator, market Marketplace) *Collector {
 	logger, _ := zap.NewProduction()
 	return &Collector{
 		coord:   coord,
@@ -68,7 +86,7 @@ func (c *Collector) Run(ctx context.Context) error {
 		c.logger.Warn("INITIAL_CLAIM_FAILED", zap.Error(err))
 	}
 
-	reclaimTicker := time.NewTicker(coordinator.ReclaimIntervalSeconds * time.Second)
+	reclaimTicker := time.NewTicker(reclaimInterval * time.Second)
 	defer reclaimTicker.Stop()
 
 	statusTicker := time.NewTicker(10 * time.Second)
