@@ -11,7 +11,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -41,7 +41,6 @@ func main() {
 	fmt.Printf("Concurrency: %d, Source: %s\n\n", *concurrency, *source)
 
 	// Инициализация
-	rand.Seed(time.Now().UnixNano())
 	_ = marketplace.NewSimulator(*source) // force import
 
 	// Генерация product_id
@@ -80,20 +79,20 @@ func main() {
 		reviews := make([]models.Review, *reviewsPerProduct)
 		now := time.Now()
 		for i := 0; i < *reviewsPerProduct; i++ {
-			rating := 1 + rand.Intn(5)
+			rating := 1 + rand.IntN(5)
 			reviews[i] = models.Review{
 				ID:        fmt.Sprintf("%s-%s-%d", *source, pid, i),
 				ProductID: pid,
 				Rating:    rating,
 				Text:      reviewText(rating),
-				Likes:     rand.Intn(50),
-				Dislikes:  rand.Intn(20),
-				Date:      now.Add(-time.Duration(rand.Intn(720)) * time.Hour),
+				Likes:     rand.IntN(50),
+				Dislikes:  rand.IntN(20),
+				Date:      now.Add(-time.Duration(rand.IntN(720)) * time.Hour),
 			}
 		}
 
 		// Симулируем задержку HTTP-запроса (как в marketplace.Simulator)
-		sleepMs := 50 + rand.Intn(150)
+		sleepMs := 50 + rand.IntN(150)
 		time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 
 		mu.Lock()
@@ -202,5 +201,5 @@ func reviewText(rating int) string {
 		5: {"Отличный товар! Всё супер!", "Лучшая покупка в этом месяце!", "Быстрая доставка, качество на высоте."},
 	}
 	opts := templates[rating]
-	return opts[rand.Intn(len(opts))]
+	return opts[rand.IntN(len(opts))]
 }

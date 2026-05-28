@@ -3,8 +3,13 @@
 *.exe~
 *.test
 *.out
-collector
-collector.exe
+# Go binaries (from go build ./cmd/...)
+/collector
+/collector.exe
+/arrow-server
+/benchmark-collector
+/benchmark-validate
+/validate-example
 
 # ── Rust ────────────────────────────────────────────
 rust-validator/target/
@@ -18,6 +23,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+*.csv
 
 # ── IDE ─────────────────────────────────────────────
 .idea/
@@ -32,8 +39,12 @@ Thumbs.db
 
 # ── Benchmark artifacts ─────────────────────────────
 benchmark_results_*.json
+benchmark/*.png
 cmd/benchmark-validate/benchmark_results*.json
 cmd/benchmark-validate/benchmark_comparison.png
 
 # ── Docker ──────────────────────────────────────────
 .dockerignore
+
+# ── Qwen Code ───────────────────────────────────────
+.qwen/
