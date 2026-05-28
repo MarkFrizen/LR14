@@ -1,8 +1,8 @@
 ---
 name: python-async-collector-etcd-nats
-description: Шаблон портирования Go-сервиса на Python asyncio: etcd-координация, NATS JetStream/Kafka, сбор метрик (psutil + CSV), бенчмаркинг Go vs Python и matplotlib-визуализация
+description: Портирование Go-сервиса на Python asyncio: etcd (HTTP API), NATS JetStream/Kafka, psutil-метрики, Go vs Python бенчмаркинг, matplotlib-чарты, sliding window агрегация (deque), Streamlit дашборд с Kafka polling
 source: auto-skill
-extracted_at: '2026-05-28T16:35:00.000Z'
+extracted_at: '2026-05-28T16:40:00.000Z'
 ---
 
 # Python async collector: портирование Go-сервиса с etcd + NATS
@@ -595,3 +595,352 @@ else:
 ```
 matplotlib>=3.7.0
 ```
+
+---
+
+## 13. Скользящее окно (Sliding Window) на deque для per-product агрегации
+
+### Когда применять
+
+Нужно вычислять скользящие агрегаты по каждому product_id в реальном времени: средний рейтинг, количество отзывов, доля негативных. Типичное окно — 5 минут, сдвиг — 1 минута.
+
+### Структура данных
+
+Используется `collections.deque` как кольцевой буфер. Каждый элемент — кортеж `(timestamp, product_id, rating, review_date_str)`.
+
+```python
+from collections import deque
+from datetime import datetime, timezone
+from typing import Optional
+
+class SlidingWindowAggregator:
+    def __init__(self, window_size: float = 300.0, slide_interval: float = 60.0):
+        self.window_size = window_size
+        self.slide_interval = slide_interval
+        self._buffer: deque[tuple[float, str, int, str]] = deque()
+        self._total_added = 0
+
+    def add(self, product_id: str, rating: int, review_date: Optional[str] = None):
+        now = time.time()
+        self._buffer.append((now, product_id, rating,
+                             review_date or datetime.now(timezone.utc).isoformat()))
+        self._total_added += 1
+
+    def prune(self):
+        """Удаляет записи старше window_size секунд."""
+        cutoff = time.time() - self.window_size
+        while self._buffer and self._buffer[0][0] < cutoff:
+            self._buffer.popleft()
+```
+
+### Алгоритм сдвига окна (выполняется каждые slide_interval секунд)
+
+```
+prune()    → удалить из deque записи с timestamp < now - window_size
+compute()  → сгруппировать по product_id, посчитать:
+               avg_rating = sum(ratings) / n
+               negative_share = count(rating < 3) / n
+               max_review_date = max(review_dates в группе)
+               latency_sec = max(0, computed_at - max_review_date)
+display()  → вывод в консоль с форматированной таблицей
+publish()  → отправка в Kafka (если есть producer)
+```
+
+### Per-product агрегация
+
+```python
+def compute(self) -> list[dict]:
+    now = time.time()
+    window_end_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+
+    # Группируем по product_id
+    per_product: dict[str, tuple[list[int], list[str]]] = {}
+    for _ts, pid, rating, rdate in self._buffer:
+        if pid not in per_product:
+            per_product[pid] = ([], [])
+        per_product[pid][0].append(rating)
+        if rdate:
+            per_product[pid][1].append(rdate)
+
+    results = []
+    for pid, (ratings, dates) in sorted(per_product.items()):
+        n = len(ratings)
+        avg_r = sum(ratings) / n if n > 0 else 0.0
+        neg = sum(1 for r in ratings if r < 3) / n if n > 0 else 0.0
+
+        # latency: самый свежий review_date → now
+        max_review_date = ""
+        latency_sec = 0.0
+        if dates:
+            max_review_date = max(dates)
+            try:
+                dt = datetime.fromisoformat(max_review_date)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                latency_sec = max(0.0, (window_end_dt - dt).total_seconds())
+            except (ValueError, TypeError):
+                pass
+
+        results.append({
+            "window_start":   window_end_dt.isoformat(),
+            "window_end":     window_end_dt.isoformat(),
+            "computed_at":    window_end_dt.isoformat(),
+            "product_id":     pid,
+            "review_count":   n,
+            "avg_rating":     round(avg_r, 2),
+            "negative_share": round(neg, 4),
+            "max_review_date": max_review_date,
+            "latency_sec":    round(latency_sec, 2),
+        })
+    return results
+```
+
+### Фоновый цикл (asyncio задача)
+
+```python
+async def _window_loop(self):
+    """Периодический сдвиг окна: prune → compute → display → publish."""
+    # Пропускаем первый slide_interval, чтобы накопить данные
+    await asyncio.sleep(self.window.slide_interval)
+
+    while not self._shutdown.is_set():
+        before = len(self.window._buffer)
+        self.window.prune()
+        after = len(self.window._buffer)
+
+        results = self.window.compute()
+        self.window.display(results)
+
+        if before != after:
+            print(f"Pruned {before - after} entries")
+
+        await self.window.publish(results)     # → Kafka topic
+
+        await asyncio.sleep(self.window.slide_interval)
+```
+
+### Публикация агрегатов в Kafka
+
+```python
+from aiokafka import AIOKafkaProducer
+
+producer = AIOKafkaProducer(
+    bootstrap_servers="localhost:9092",
+    acks=1,
+    compression_type="snappy",
+)
+
+for agg in results:
+    await producer.send(
+        "reviews.aggregated",
+        key=agg["product_id"].encode(),   # → partition по товару
+        value=json.dumps(agg).encode(),
+    )
+await producer.flush()
+```
+
+### Вывод в консоль
+
+```
+─── [14:23:05] Sliding Window Aggregates ───
+  Window: 5 min, slide: 1 min, buffer: 847 reviews
+  Product      Count  AvgRat  NegShare
+  ──────────── ────── ─────── ─────────
+  WB-001         42    4.15     4.8%
+  WB-002         38    3.72    10.5%
+  OZ-101         29    2.93    24.1%
+```
+
+---
+
+## 14. Streamlit дашборд с Kafka polling (background thread + kafka-python)
+
+### Когда применять
+
+Нужно визуализировать данные из Kafka в реальном времени в Streamlit. Streamlit работает в синхронном однопоточном режиме — Kafka-консьюмер нужно запускать в **фоновом потоке** с передачей данных через `queue.Queue`.
+
+### Архитектура
+
+```
+[Kafka topic: reviews.aggregated]
+       │
+       ▼
+[Background thread: KafkaConsumer → queue.Queue]
+       │  polling каждые 2 сек
+       ▼
+[Streamlit main thread: drain queue → session_state → render]
+       │  rerun каждые 5 сек
+       ▼
+[Plotly charts + KPI + table]
+```
+
+### Фоновый Kafka listener
+
+```python
+import json
+import queue
+import threading
+import time
+from kafka import KafkaConsumer
+
+_msg_queue: queue.Queue = queue.Queue(maxsize=5000)
+
+def kafka_listener(bootstrap_servers: str, stop_event: threading.Event):
+    """Фоновый поток: читает Kafka, кладёт в queue.Queue."""
+    consumer = KafkaConsumer(
+        "reviews.aggregated",
+        bootstrap_servers=bootstrap_servers,
+        group_id="streamlit-dashboard",
+        auto_offset_reset="latest",
+        enable_auto_commit=True,
+        key_deserializer=lambda k: k.decode() if k else None,
+        value_deserializer=lambda v: json.loads(v.decode()) if v else None,
+        max_poll_records=500,
+    )
+
+    while not stop_event.is_set():
+        msgs = consumer.poll(timeout_ms=2000)
+        for _tp, records in msgs.items():
+            for msg in records:
+                if msg.value is None:
+                    continue
+                try:
+                    _msg_queue.put_nowait(msg.value)
+                except queue.Full:
+                    # очередь полна — вытесняем старые
+                    try:
+                        while _msg_queue.qsize() >= 5000:
+                            _msg_queue.get_nowait()
+                        _msg_queue.put_nowait(msg.value)
+                    except queue.Empty:
+                        pass
+    consumer.close()
+```
+
+**Ключевые моменты:**
+- `enable_auto_commit=True` — упрощает commit (не нужно ручное управление для дашборда)
+- `group_id` позволяет масштабировать дашборды (каждый получает свою долю партиций)
+- `queue.Queue(maxsize=5000)` — buffer между потоком и Streamlit, предотвращает переполнение памяти
+
+### Интеграция с Streamlit
+
+```python
+import streamlit as st
+
+def init_session_state():
+    if "aggregates" not in st.session_state:
+        st.session_state.aggregates = []
+    if "listener_started" not in st.session_state:
+        st.session_state.listener_started = False
+
+def start_listener(bootstrap_servers: str):
+    if st.session_state.listener_started:
+        return
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=kafka_listener,
+        args=(bootstrap_servers, stop_event),
+        daemon=True,
+    )
+    thread.start()
+    st.session_state.listener_started = True
+    st.session_state._stop_event = stop_event
+
+def drain_queue():
+    """Вычитывает все сообщения из очереди в session_state."""
+    while not _msg_queue.empty():
+        try:
+            agg = _msg_queue.get_nowait()
+            st.session_state.aggregates.append(agg)
+        except queue.Empty:
+            break
+    # Ограничение памяти
+    MAX_AGGREGATES = 2000
+    if len(st.session_state.aggregates) > MAX_AGGREGATES:
+        st.session_state.aggregates = \
+            st.session_state.aggregates[-MAX_AGGREGATES:]
+```
+
+### Рендеринг графиков (Plotly)
+
+```python
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+def get_df() -> pd.DataFrame:
+    df = pd.DataFrame(st.session_state.aggregates)
+    for col in ("window_start", "window_end", "computed_at", "max_review_date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+def plot_avg_rating(df: pd.DataFrame):
+    """Линейный график среднего рейтинга по времени."""
+    fig = go.Figure()
+    for pid in df["product_id"].unique():
+        pdf = df[df["product_id"] == pid].sort_values("computed_at")
+        fig.add_trace(go.Scatter(x=pdf["computed_at"], y=pdf["avg_rating"],
+                                 mode="lines+markers", name=pid))
+    fig.update_layout(
+        title="Средний рейтинг (скользящее окно 5 мин)",
+        xaxis_title="Время", yaxis_title="Рейтинг",
+        yaxis=dict(range=[1, 5]),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+def plot_latency(df: pd.DataFrame):
+    """График задержки end-to-end."""
+    latency_df = (df.groupby("computed_at")["latency_sec"]
+                  .mean().reset_index().sort_values("computed_at"))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=latency_df["computed_at"],
+                             y=latency_df["latency_sec"],
+                             mode="lines+markers", name="Latency",
+                             line=dict(color="red"), fill="tozeroy"))
+    fig.update_layout(title="Задержка end-to-end", yaxis_title="сек")
+    st.plotly_chart(fig, use_container_width=True)
+```
+
+### Auto-refresh
+
+```python
+REFRESH_SECONDS = 5
+
+if st.sidebar.checkbox("Автообновление", value=True):
+    time.sleep(REFRESH_SECONDS)
+    st.rerun()
+```
+
+### Запуск дашборда
+
+```bash
+.venv/bin/pip install streamlit pandas plotly kafka-python
+.venv/bin/streamlit run dashboard_kafka.py -- --bootstrap-servers localhost:9092
+```
+
+### Требования к данным в Kafka
+
+Ожидается JSON с полями:
+```json
+{
+  "window_start": "2026-05-28T12:00:00+00:00",
+  "window_end":   "2026-05-28T12:05:00+00:00",
+  "computed_at":  "2026-05-28T12:05:03+00:00",
+  "product_id":   "WB-001",
+  "review_count": 42,
+  "avg_rating":   4.15,
+  "negative_share": 0.05,
+  "max_review_date": "2026-05-28T12:04:00+00:00",
+  "latency_sec":  63.0
+}
+```
+
+### Типичные ошибки
+
+- **Streamlit + asyncio.** Streamlit не поддерживает `asyncio.run()` внутри скрипта — используйте синхронный `KafkaConsumer` в потоке, а не `AIOKafkaConsumer`.
+- **Переполнение памяти.** Без ограничения `MAX_AGGREGATES` список будет расти бесконечно. Устанавливайте лимит (2000-5000 записей).
+- **Очередь переполнена.** Если Kafka шлёт быстрее, чем Streamlit рендерит, очередь растёт. Используйте `maxsize` и вытеснение старых записей.
+- **group_id.** Без group_id каждый запуск дашборда будет читать все сообщения с начала. Используйте `group_id` с `auto_offset_reset="latest"`.
+- **dataframe колонки.** Парсинг дат через `pd.to_datetime(..., errors="coerce")` защищает от невалидных строк.
