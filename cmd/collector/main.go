@@ -17,18 +17,16 @@ import (
 	"github.com/markfriz/wb-ozon-review-collector/internal/aggregator"
 	"github.com/markfriz/wb-ozon-review-collector/internal/collector"
 	"github.com/markfriz/wb-ozon-review-collector/internal/coordinator"
+	"github.com/markfriz/wb-ozon-review-collector/internal/kafkapub"
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
-	"github.com/markfriz/wb-ozon-review-collector/internal/monitor"
-	"github.com/markfriz/wb-ozon-review-collector/internal/natspub"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 )
 
 func main() {
 	var (
 		etcdEndpoints = flag.String("etcd", "localhost:2379", "etcd endpoints (comma-separated)")
-		natsURL       = flag.String("nats", "nats://localhost:4222", "NATS server URL")
+		kafkaBrokers  = flag.String("kafka", "localhost:9092", "Kafka brokers (comma-separated)")
 		workerID      = flag.String("worker", defaultWorkerID(), "unique worker ID")
 		source        = flag.String("source", "wildberries", "marketplace source (wildberries/ozon)")
 		windowDur     = flag.Duration("window", 1*time.Minute, "tumbling window duration (e.g. 30s, 1m, 5m)")
@@ -103,85 +101,48 @@ func main() {
 	}()
 
 	// ========================================================================
-	// 3. Оконная агрегация с поддержкой поздних событий (watermark)
+	// 3. Kafka producer — публикация сырых отзывов в "reviews.raw"
 	// ========================================================================
-	//
-	// Алгоритм:
-	//   1. Каждый отзыв маршрутизируется в окно по review.Date (event time).
-	//   2. Окна хранятся в хеш-таблице windowStore с sync.Mutex.
-	//   3. На каждом тике ticker'а окна, чьё время истекло, флашатся.
-	//   4. После флаша окно остаётся в памяти на время watermark.
-	//   5. Поздние события вызывают пересчёт → WindowAgg с IsUpdate=true.
-	//   6. Окна старше watermark удаляются.
-	//
-	// Пайплайн:
-	//   collector ──► tw.Input()
-	//                    │
-	//          ┌─────────┴──────────────┐
-	//          │ review.Date → windowKey │
-	//          │ store.getOrCreate()     │
-	//          │ accumulate()            │
-	//          │ if flushed → recompute  │
-	//          └─────────┬──────────────┘
-	//                    │
-	//          ┌─────────┴──────────────┐
-	//          │ ticker: reapWindows()  │
-	//          │   • flush closed       │
-	//          │   • evict old          │
-	//          └─────────┬──────────────┘
-	//                    │
-	//                    ▼
-	//               tw.Output()
-	//              (WindowAgg)
-	//                    │
-	//          ┌─────────┴──────────┐
-	//          ▼                    ▼
-	//   NATS reviews.windowed    zap.Logger
+	brokers := splitEndpoints(*kafkaBrokers)
+	logger.Info("CONNECTING_TO_KAFKA",
+		zap.Strings("brokers", brokers),
+	)
 
+	kafkaPub := kafkapub.NewKafkaPublisher(brokers, logger)
+
+	// Канал для подсчёта опубликованных сырых отзывов.
+	var rawPublished atomic.Int64
+	var rawFailed atomic.Int64
+
+	// ========================================================================
+	// 4. Оконная агрегация (tumbling window) — для WindowAgg
+	// ========================================================================
 	tw := aggregator.NewTumblingWindow(*windowDur, *watermark, 5000)
 
-	// Forward: collector → aggregator
+	// Forward: collector → Kafka (raw) + aggregator (windowed)
 	go func() {
 		for review := range col.Reviews() {
+			// --- публикуем сырой отзыв в Kafka (топик reviews.raw) ---
+			if err := kafkaPub.PublishRaw(ctx, review); err != nil {
+				rawFailed.Add(1)
+				logger.Warn("KAFKA_PUBLISH_RAW_FAILED",
+					zap.String("review_id", review.ID),
+					zap.Error(err),
+				)
+			} else {
+				rawPublished.Add(1)
+			}
+
+			// --- отправляем в агрегатор для оконной обработки ---
 			tw.Input() <- review
 		}
 		tw.Stop()
 	}()
 
-	// ========================================================================
-	// 4. NATS JetStream — публикатор агрегированных окон
-	// ========================================================================
-	ncConn, jsClient, err := natspub.NewNATSClient(ctx, *natsURL, logger)
-	if err != nil {
-		log.Fatalf("FAILED to create NATS client: %v", err)
-	}
-	publisher, err := natspub.NewJetStreamPublisher(ctx, ncConn, jsClient, logger)
-	if err != nil {
-		log.Fatalf("FAILED to create NATS publisher: %v", err)
-	}
-	defer func() {
-		logger.Info("NATS_PUBLISHER_CLOSE")
-		pub, failed, pending := publisher.Stats()
-		logger.Info("NATS_FINAL_STATS",
-			zap.Int64("windowed_published", pub),
-			zap.Int64("failed", failed),
-			zap.Int64("pending", pending),
-		)
-		if err := publisher.Close(); err != nil {
-			logger.Error("NATS_PUBLISHER_CLOSE_ERROR", zap.Error(err))
-		}
-	}()
-
-	// Читает WindowAgg из агрегатора, публикует в NATS + логирует.
+	// Горутина: читает WindowAgg из агрегатора, логирует результаты.
+	// В будущем можно добавить публикацию WindowAgg в отдельный Kafka-топик.
 	go func() {
 		for agg := range tw.Output() {
-			if err := publisher.PublishWindowAgg(ctx, agg); err != nil {
-				logger.Error("PUBLISH_WINDOW_FAILED",
-					zap.String("product", agg.ProductID),
-					zap.Error(err),
-				)
-			}
-
 			if agg.IsUpdate {
 				logger.Info("WINDOW_UPDATE_PUBLISHED",
 					zap.String("product", agg.ProductID),
@@ -206,26 +167,13 @@ func main() {
 	// Запуск агрегатора.
 	go tw.Run(ctx)
 
-	// ========================================================================
-	// 4b. Prometheus-монитор очереди NATS JetStream
-	// ========================================================================
-	const consumerName = "review-collector-worker"
-	jsMon := publisher.JetStream()
-
-	_, err = monitor.MustRegisterConsumer(ctx, jsMon, natspub.StreamName, consumerName, natspub.RawSubject, logger)
-	if err != nil {
-		logger.Warn("CONSUMER_REGISTRATION_FAILED", zap.Error(err))
-	}
-
-	qm := monitor.NewQueueMonitor(jsMon, natspub.StreamName, []string{consumerName}, logger)
-	go qm.Run(ctx)
-
 	logger.Info("PIPELINE_STARTED",
 		zap.String("worker", *workerID),
 		zap.String("source", *source),
 		zap.Duration("window", *windowDur),
 		zap.Duration("watermark", *watermark),
-		zap.String("nats_subject", natspub.WindowedSubject),
+		zap.Strings("kafka_brokers", brokers),
+		zap.String("kafka_topic", kafkapub.TopicRawReviews),
 	)
 
 	// ========================================================================
@@ -245,7 +193,6 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.Handle("/metrics", promhttp.Handler())
 
 	healthListener, err := net.Listen("tcp", *healthAddr)
 	if err != nil {
@@ -294,6 +241,15 @@ func main() {
 
 	col.Stop()
 	<-tw.Flushed()
+
+	// Закрываем Kafka producer (flush + close).
+	logger.Info("KAFKA_PUBLISHER_STATS",
+		zap.Int64("raw_published", rawPublished.Load()),
+		zap.Int64("raw_failed", rawFailed.Load()),
+	)
+	if err := kafkaPub.Close(); err != nil {
+		logger.Error("KAFKA_PUBLISHER_CLOSE_ERROR", zap.Error(err))
+	}
 
 	logger.Info("RELEASING_SHARDS", zap.Int("shard_count", len(coord.OwnedProducts())))
 	if err := coord.ReleaseAll(shutdownCtx); err != nil {

@@ -6,6 +6,7 @@ require (
 	github.com/apache/arrow/go/v17 v17.0.0
 	github.com/nats-io/nats.go v1.52.0
 	github.com/prometheus/client_golang v1.23.2
+	github.com/segmentio/kafka-go v0.4.47
 	go.etcd.io/etcd/api/v3 v3.6.11
 	go.etcd.io/etcd/client/v3 v3.6.11
 	go.uber.org/zap v1.28.0

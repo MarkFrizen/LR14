@@ -1,8 +1,8 @@
 ---
 name: python-async-collector-etcd-nats
-description: Шаблон портирования Go-сервиса (etcd-координация + NATS JetStream) на Python asyncio, включая сбор метрик производительности (psutil + CSV) и бенчмаркинг Go vs Python
+description: Шаблон портирования Go-сервиса на Python asyncio: etcd-координация, NATS JetStream/Kafka, сбор метрик (psutil + CSV), бенчмаркинг Go vs Python и matplotlib-визуализация
 source: auto-skill
-extracted_at: '2026-05-28T16:10:00.000Z'
+extracted_at: '2026-05-28T16:35:00.000Z'
 ---
 
 # Python async collector: портирование Go-сервиса с etcd + NATS
@@ -319,3 +319,279 @@ psutil>=5.9.0       # метрики (RSS, CPU) — опционально, то
 - **CAS без лизинга**: при создании ключа назначения нужно передавать `lease`, иначе при падении воркера шард не освободится.
 - **Drain vs Close**: NATS требует drain (дождаться подтверждений), а потом close. Обратный порядок — потеря сообщений.
 - **add_signal_handler не везде**: на Windows может не работать. Нужен fallback через стандартный `signal.signal`.
+
+---
+
+## 11. Замена NATS на Kafka (паттерн миграции)
+
+### Мотивация
+
+NATS JetStream — лёгкий in-memory брокер, Kafka — долговременное лог-хранилище с партициями, ретеншеном по диску и consumer groups. Замена актуальна при требованиях к долгому хранению событий (сутки+) или стандартизации на Kafka в инфраструктуре.
+
+### Что меняется
+
+| Аспект | NATS JetStream | Kafka |
+|---|---|---|
+| Топик | subject (`reviews.raw`) | topic (`reviews.raw`) |
+| Продусер | `js.publish(subject, data, headers={Nats-Msg-Id})` | `writer.WriteMessages(ctx, msg{Key, Value})` |
+| Партицирование | автоматическое (stream) | `hash(key) % N` (kafka.Hash) |
+| Дедупликация | `WithMsgID` + duplicates window (2 min) | идемпотентность producer (config) |
+| Консьюмер | push/pull subscribe + explicit ack | poll + manual commit |
+| Гарантия доставки | exactly-once (dedup) | at-least-once (manual commit) |
+| Зависимости (Go) | `nats.go` + `nats.go/jetstream` | `segmentio/kafka-go` |
+| Зависимости (Python) | `nats-py` | `aiokafka` |
+
+### Go: Kafka producer (segmentio/kafka-go)
+
+```go
+import (
+    "github.com/segmentio/kafka-go"
+    "github.com/segmentio/kafka-go/compress"
+)
+
+const TopicRawReviews = "reviews.raw"
+
+type KafkaPublisher struct {
+    writer *kafka.Writer
+}
+
+func NewKafkaPublisher(brokers []string) *KafkaPublisher {
+    w := &kafka.Writer{
+        Addr:         kafka.TCP(brokers...),
+        Topic:        TopicRawReviews,
+        Balancer:     &kafka.Hash{},     // key → hash → partition
+        Compression:  compress.Snappy,
+        WriteTimeout: 30 * time.Second,
+        RequiredAcks: kafka.RequireOne,  // ждём от лидера
+        Async:        false,             // синхронно
+    }
+    return &KafkaPublisher{writer: w}
+}
+
+func (kp *KafkaPublisher) PublishRaw(ctx context.Context, review models.Review) error {
+    data, _ := json.Marshal(review)
+    msg := kafka.Message{
+        Key:   []byte(review.ProductID),           // → partition по товару
+        Value: data,                                 // JSON
+    }
+    return kp.writer.WriteMessages(ctx, msg)
+}
+
+func (kp *KafkaPublisher) PublishRawBatch(ctx context.Context, reviews []models.Review) error {
+    msgs := make([]kafka.Message, len(reviews))
+    for i, r := range reviews {
+        data, _ := json.Marshal(r)
+        msgs[i] = kafka.Message{Key: []byte(r.ProductID), Value: data}
+    }
+    return kp.writer.WriteMessages(ctx, msgs...)
+}
+
+func (kp *KafkaPublisher) Close() error {
+    return kp.writer.Close()
+}
+```
+
+**Ключевые моменты:**
+- `kafka.Hash` balancer = `hash(product_id) % num_partitions` — все отзывы одного товара в одной партиции (гарантия порядка)
+- `RequiredAcks = RequireOne` — лидер подтвердил запись в свой лог (быстрее чем `All`)
+- `WriteMessages` с одним или батчем сообщений. batch сообщения могут идти в разные партиции — Kafka writer сам разбивает
+- Pull-based: `partition_consumer` не нужен, `kafka.Writer` сам батчит и шардирует
+
+**Интеграция в Go pipeline (замена NATS):**
+
+Было (NATS):
+```go
+ncConn, jsClient, _ := natspub.NewNATSClient(ctx, natsURL, logger)
+publisher, _ := natspub.NewJetStreamPublisher(ctx, ncConn, jsClient, logger)
+
+for review := range col.Reviews() {
+    publisher.PublishWindowAgg(ctx, agg)  // только windowed
+}
+```
+
+Стало (Kafka):
+```go
+kafkaPub := kafkapub.NewKafkaPublisher(brokers, logger)
+
+for review := range col.Reviews() {
+    kafkaPub.PublishRaw(ctx, review)      // сырые отзывы в reviews.raw
+    tw.Input() <- review                   // агрегатор остаётся
+}
+```
+
+### Python: Kafka consumer (aiokafka)
+
+```python
+from aiokafka import AIOKafkaConsumer, TopicPartition
+
+class KafkaReviewConsumer:
+    def __init__(self, bootstrap_servers: str, group_id: str, topic: str):
+        self.consumer = AIOKafkaConsumer(
+            topic,
+            bootstrap_servers=bootstrap_servers,
+            group_id=group_id,
+            enable_auto_commit=False,        # ручной commit
+            auto_offset_reset="earliest",    # start from beginning if no offset
+            max_poll_records=500,
+        )
+
+    async def start(self):
+        await self.consumer.start()
+        partitions = self.consumer.assignment()
+        print(f"Assigned: {[str(p) for p in partitions]}")
+
+    async def run(self):
+        self._last_offsets: dict[TopicPartition, int] = {}
+
+        while not self._shutdown.is_set():
+            msgs = await self.consumer.getmany(timeout_ms=2000, max_records=500)
+
+            for tp, records in msgs.items():
+                for msg in records:
+                    review = json.loads(msg.value)
+                    self.process_review(review)
+                    self._last_offsets[tp] = msg.offset + 1   # next offset = commit marker
+
+            # Ручной commit — at-least-once семантика
+            if self._last_offsets:
+                await self.consumer.commit(self._last_offsets)
+
+    async def stop(self):
+        if self._last_offsets:
+            await self.consumer.commit(self._last_offsets)  # перед отключением
+        await self.consumer.stop()
+```
+
+**Обработка партиций:**
+- `consumer.assignment()` — список `TopicPartition`, назначенных этому consumer
+- `getmany()` — возвращает `dict[TopicPartition, list[ConsumerRecord]]`
+- Ручной commit: `consumer.commit({tp: offset})` — указываете offset **следующего** сообщения для каждой партиции
+- Consumer group: если несколько instance с одним `group_id`, Kafka делит партиции между ними (ребалансировка при добавлении/удалении)
+
+**Обработка отзыва партиций (при ребалансе):**
+```python
+# Вариант 1: обработчики через consumer.subscribe() с on_revoke=
+consumer.subscribe(
+    [topic],
+    listener=ConsumerRebalanceListener(
+        on_partitions_revoked=lambda revoked: await consumer.commit(offsets)
+    )
+)
+```
+
+**Вариант 2** (проще): commit перед каждым stop — гарантирует, что при graceful shutdown offsets сохранены.
+
+### Зависимости для Kafka
+
+Go `go.mod`:
+```
+github.com/segmentio/kafka-go v0.4.47
+```
+
+Python `requirements.txt`:
+```
+aiokafka>=0.14.0
+```
+
+---
+
+## 12. Визуализация сравнения Go vs Python (matplotlib)
+
+Скрипт запускает оба бенчмарка и строит три bar-диаграммы рядом.
+
+### Данные для сравнения
+
+Из Go бенчмарка (runtime.ReadMemStats + syscall.Getrusage):
+- `wall_clock_s` (сек)
+- `rps` (reviews/sec)
+- `max_rss_mb` (getrusage.RUSAGE_SELF.Maxrss в MB)
+- `cpu_pct` (CPU time / wall time)
+
+Из Python бенчмарка (MetricsCollector с psutil):
+- `wall_clock_s`
+- `rps` / `peak_rps`
+- `avg_rss_mb` / `peak_rss_mb` (psutil.Process.memory_info().rss)
+- `avg_cpu_pct` / `peak_cpu_pct` (psutil.Process.cpu_percent(interval=0))
+
+### Извлечение JSON-сводки
+
+Оба бенчмарка печатают строку `SUMMARY_JSON:{"language":"go",...}` — парсится через regex:
+
+```python
+m = re.search(r"SUMMARY_JSON:\s*(\{.*\})", output, re.DOTALL)
+data = json.loads(m.group(1))
+```
+
+### Код визуализации
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_comparison(py: dict, go: dict, output_path: str):
+    rps    = [go["rps"], py["rps"]]
+    mem    = [go["max_rss_mb"], py["peak_rss_mb"]]
+    cpu    = [go["cpu_pct"], py["avg_cpu_pct"]]
+
+    labels = ["Go", "Python"]
+    colors = ["#1f77b4", "#ff7f0e"]
+    x = np.arange(2)
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+    fig.suptitle("Сравнение Go vs Python", fontsize=13, fontweight="bold")
+
+    # 1. Throughput (RPS)
+    ax = axes[0]
+    ax.bar(x, rps, 0.5, color=colors)
+    ax.set_ylabel("reviews / sec")
+    ax.set_title("Пропускная способность (RPS)")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    for bar, val in zip(bars, rps):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f"{val:.0f}", ha="center", va="bottom", fontweight="bold")
+
+    # 2. Memory (RSS)
+    ax = axes[1]
+    ax.bar(x, mem, 0.5, color=colors)
+    ax.set_ylabel("MB")
+    ax.set_title("Потребление памяти (Max RSS)")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+
+    # 3. CPU
+    ax = axes[2]
+    ax.bar(x, cpu, 0.5, color=colors)
+    ax.set_ylabel("%")
+    ax.set_title("Загрузка CPU")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+```
+
+### Текстовый вывод с коэффициентами
+
+```python
+# Go быстрее Python в X раз по пропускной способности
+if go_rps >= py_rps:
+    rps_part = f"Go быстрее Python в {go_rps/py_rps:.2f} раза"
+else:
+    rps_part = f"Python быстрее Go в {py_rps/go_rps:.2f} раза"
+
+# Go потребляет в Y раз меньше/больше памяти
+if go_mem <= py_mem:
+    mem_part = f"Go потребляет в {py_mem/go_mem:.1f} раза меньше памяти (RSS)"
+else:
+    mem_part = f"Go потребляет в {go_mem/py_mem:.1f} раза больше памяти (RSS)"
+
+# Go загружает CPU в Z раз меньше/больше
+if go_cpu <= py_cpu:
+    cpu_part = f"Go загружает CPU в {py_cpu/go_cpu:.1f} раза меньше"
+else:
+    cpu_part = f"Go загружает CPU в {go_cpu/py_cpu:.1f} раза больше"
+```
+
+### Зависимости для визуализации
+
+```
+matplotlib>=3.7.0
+```
