@@ -89,6 +89,9 @@ class MetricsCollector:
 
         self._snapshots: list[MetricsSnapshot] = []
 
+        # Инициализация CPU-счётчика (первый вызов cpu_percent возвращает 0)
+        self.process.cpu_percent(interval=None)
+
         # Инициализация CSV (заголовок)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.csv_path.exists():

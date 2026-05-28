@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/markfriz/wb-ozon-review-collector/internal/marketplace"
@@ -152,6 +153,21 @@ func main() {
 	var memFinal runtime.MemStats
 	runtime.ReadMemStats(&memFinal)
 
+	// Max RSS через getrusage
+	var rusage syscall.Rusage
+	syscall.Getrusage(syscall.RUSAGE_SELF, &rusage)
+	maxRSSMB := float64(rusage.Maxrss) / 1024 // на Linux Maxrss в KB
+
+	// CPU time (пользовательское + системное)
+	cpuTimeSec := float64(rusage.Utime.Sec+rusage.Stime.Sec) +
+		float64(rusage.Utime.Usec+rusage.Stime.Usec)/1_000_000
+
+	wallSec := elapsed
+	cpuPercent := 0.0
+	if wallSec > 0 {
+		cpuPercent = cpuTimeSec / wallSec * 100
+	}
+
 	sep := strings.Repeat("=", 60)
 	fmt.Printf("\n%s\n", sep)
 	fmt.Printf("  GO BENCHMARK RESULTS\n")
@@ -160,6 +176,9 @@ func main() {
 	fmt.Printf("  Total reviews:    %8d\n", totalReviews)
 	fmt.Printf("  Products done:    %8d\n", productCount)
 	fmt.Printf("  Throughput:       %8.1f rev/s\n", float64(totalReviews)/elapsed)
+	fmt.Printf("  CPU time:         %8.2f s\n", cpuTimeSec)
+	fmt.Printf("  CPU usage:        %8.1f %%\n", cpuPercent)
+	fmt.Printf("  Max RSS:          %8.1f MB\n", maxRSSMB)
 	fmt.Printf("  Alloc (final):    %8.1f MB\n", float64(memFinal.Alloc)/1024/1024)
 	fmt.Printf("  Total alloc:      %8.1f MB\n", float64(memFinal.TotalAlloc)/1024/1024)
 	fmt.Printf("  GC cycles:        %8d\n", memFinal.NumGC)
@@ -167,8 +186,9 @@ func main() {
 
 	// Вывод summary-строки для парсинга скриптом сравнения
 	fmt.Printf("\nSUMMARY_JSON:")
-	fmt.Printf(`{"language":"go","wall_clock_s":%.2f,"total_reviews":%d,"products":%d,"rps":%.1f,"alloc_final_mb":%.1f,"total_alloc_mb":%.1f,"gc_cycles":%d}`,
+	fmt.Printf(`{"language":"go","wall_clock_s":%.2f,"total_reviews":%d,"products":%d,"rps":%.1f,"cpu_pct":%.1f,"max_rss_mb":%.1f,"alloc_final_mb":%.1f,"total_alloc_mb":%.1f,"gc_cycles":%d}`,
 		elapsed, totalReviews, productCount, float64(totalReviews)/elapsed,
+		cpuPercent, maxRSSMB,
 		float64(memFinal.Alloc)/1024/1024, float64(memFinal.TotalAlloc)/1024/1024, memFinal.NumGC)
 	fmt.Println()
 }
