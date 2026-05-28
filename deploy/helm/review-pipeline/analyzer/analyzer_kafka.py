@@ -62,16 +62,24 @@ class SlidingWindowAggregator:
         self.producer = producer
         self.agg_topic = agg_topic
 
-        # Кольцевой буфер: deque из (timestamp, product_id, rating)
-        self._buffer: deque[tuple[float, str, int]] = deque()
+        # Кольцевой буфер: deque из (arrival_ts, product_id, rating, review_date_str)
+        self._buffer: deque[tuple[float, str, int, str]] = deque()
         self._total_added: int = 0
 
     # ── публичный API ─────────────────────────────────────────────
 
-    def add(self, product_id: str, rating: int):
-        """Добавляет отзыв в окно (вызывается из consumer)."""
+    def add(self, product_id: str, rating: int,
+            review_date: Optional[str] = None):
+        """Добавляет отзыв в окно (вызывается из consumer).
+
+        Args:
+            product_id: ID товара
+            rating: оценка (1-5)
+            review_date: ISO-строка даты сбора отзыва (для latency)
+        """
         now = time.time()
-        self._buffer.append((now, product_id, rating))
+        self._buffer.append((now, product_id, rating,
+                             review_date or datetime.now(timezone.utc).isoformat()))
         self._total_added += 1
 
     def prune(self):
@@ -85,13 +93,15 @@ class SlidingWindowAggregator:
 
         Возвращает список словарей:
           {
-            "window_start": "ISO",
-            "window_end":   "ISO",
-            "computed_at":  "ISO",
-            "product_id":   "WB-001",
-            "review_count": 42,
-            "avg_rating":   4.2,
-            "negative_share": 0.05,   # rating < 3
+            "window_start":   "ISO",
+            "window_end":     "ISO",
+            "computed_at":    "ISO",
+            "product_id":     "WB-001",
+            "review_count":   42,
+            "avg_rating":     4.2,
+            "negative_share": 0.05,          # rating < 3
+            "max_review_date": "2026-05-28T12:04:00",  # самый свежий отзыв в окне
+            "latency_sec":    90.0,          # computed_at - max_review_date
           }
         """
         now = time.time()
@@ -100,24 +110,43 @@ class SlidingWindowAggregator:
             now - self.window_size, tz=timezone.utc)
 
         # Группируем по product_id
-        per_product: dict[str, list[int]] = {}
-        for _ts, pid, rating in self._buffer:
-            per_product.setdefault(pid, []).append(rating)
+        per_product: dict[str, tuple[list[int], list[str]]] = {}
+        for _ts, pid, rating, rdate in self._buffer:
+            if pid not in per_product:
+                per_product[pid] = ([], [])
+            per_product[pid][0].append(rating)
+            if rdate:
+                per_product[pid][1].append(rdate)
 
         results: list[dict] = []
-        for pid, ratings in sorted(per_product.items()):
+        for pid, (ratings, dates) in sorted(per_product.items()):
             n = len(ratings)
             avg_r = sum(ratings) / n if n > 0 else 0.0
             neg = sum(1 for r in ratings if r < 3) / n if n > 0 else 0.0
 
+            # latency: самый свежий review_date → now
+            max_review_date = ""
+            latency_sec = 0.0
+            if dates:
+                max_review_date = max(dates)
+                try:
+                    dt = datetime.fromisoformat(max_review_date)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    latency_sec = max(0.0, (window_end_dt - dt).total_seconds())
+                except (ValueError, TypeError):
+                    pass
+
             results.append({
-                "window_start": window_start_dt.isoformat(),
-                "window_end":   window_end_dt.isoformat(),
-                "computed_at":  window_end_dt.isoformat(),
-                "product_id":   pid,
-                "review_count": n,
-                "avg_rating":   round(avg_r, 2),
+                "window_start":   window_start_dt.isoformat(),
+                "window_end":     window_end_dt.isoformat(),
+                "computed_at":    window_end_dt.isoformat(),
+                "product_id":     pid,
+                "review_count":   n,
+                "avg_rating":     round(avg_r, 2),
                 "negative_share": round(neg, 4),
+                "max_review_date": max_review_date,
+                "latency_sec":    round(latency_sec, 2),
             })
 
         return results
@@ -367,8 +396,10 @@ class KafkaReviewConsumer:
                             # ── скользящее окно ──
                             pid = review.get("product_id", "unknown")
                             rating = review.get("rating", 0)
+                            rev_date = review.get("date")
                             if 1 <= rating <= 5:
-                                self.window.add(pid, rating)
+                                self.window.add(pid, rating,
+                                                review_date=rev_date)
                         except (json.JSONDecodeError, KeyError) as e:
                             print(f"[CONSUMER] Invalid message: {e}",
                                   file=sys.stderr)
